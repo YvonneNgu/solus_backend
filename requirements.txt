@@ -1,0 +1,6 @@
+livekit-api
+livekit-agents[google,silero,deepgram,turn-detector]
+python-dotenv
+fastapi
+uvicorn
+langfuse
