@@ -50,6 +50,7 @@ async def get_token(participant: str):
             room_join=True,
             can_subscribe=True,
             can_publish=True,
+            can_publish_data=True,
         ))
     
     return {
@@ -58,4 +59,4 @@ async def get_token(participant: str):
     }
 
 if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=5000, reload=True)

@@ -42,7 +42,10 @@ from livekit.agents.utils.images.image import encode, EncodeOptions
 from livekit.agents.utils.images.image import ResizeOptions
 from livekit.plugins.turn_detector.english import EnglishModel
 from PIL import Image
-#from knowledge_manager import KnowledgeManager
+
+# Import the tool functions
+from tools.lookup_weather import lookup_weather
+from tools.identify_screen_elements import identify_screen_elements
 
 logger = logging.getLogger("openai-video-agent")
 logger.setLevel(logging.INFO)
@@ -50,9 +53,6 @@ logger.setLevel(logging.INFO)
 load_dotenv()
 
 _langfuse = Langfuse()
-
-# Initialize knowledge manager
-#knowledge_manager = KnowledgeManager()
 
 INSTRUCTIONS = f"""
 You are a mobile voice assistant, Solus, who can answer general questions, help with app navigation, and answer questions about the user's screen. 
@@ -62,6 +62,7 @@ User can share their screen to show you the issue. But sometimes they just want 
 You have some powerful tools:
 - Look up weather information for a given location
 - Identify interactive UI elements and their positions on the screen to help with app navigation. When users ask for help navigating an app, you can use this tool to analyze the screen and guide them to specific buttons, fields, or other interactive elements by providing the position in the result of this tool.
+- Display navigation guidance with visual cues on the user's screen to help them navigate apps step by step.
 
 The tools might fail, tell the user if you fail to use the tool and provide another way to help them.
 IMPORTANT: Respond in plain text only. Do not use any markdown formatting including bold, italics, bullet points, numbered lists, or other markdown syntax. Your responses will be read aloud by text-to-speech.
@@ -72,9 +73,8 @@ If user's query need their screen context but no screen sharing is detected, let
 
 Keep responses short, maximum 100 words while staying helpful and accurate.
 
-
+When providing navigation guidance, use the display_navigation_guidance tool to show visual cues on the user's screen alongside your spoken instructions.
 """
-# {knowledge_manager.format_knowledge()}
 
 class VideoAgent(Agent):
     def __init__(self, instructions: str, room: rtc.Room) -> None:
@@ -105,183 +105,122 @@ class VideoAgent(Agent):
         Args:
             location: The location to look up weather information for.
         """
-        logger.info(f"Getting weather for {location}")
-        
-        # Create a span in Langfuse for tracking
-        span = self.get_current_trace().span(name="weather_lookup", metadata={"location": location})
-        
-        try:
-            # Use wttr.in API to get weather data
-            url = f"https://wttr.in/{location}?format=%C+%t"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        weather_data = await response.text()
-                        result = {
-                            "condition": weather_data.split()[0],
-                            "temperature": weather_data.split()[1],
-                            "location": location
-                        }
-                        logger.info(f"Weather result: {result}")
-                        return result
-                    else:
-                        error_msg = f"Failed to get weather data, status code: {response.status}"
-                        logger.error(error_msg)
-                        span.update(level="ERROR")
-                        return {"error": error_msg}
-        except Exception as e:
-            error_msg = f"Weather lookup error: {str(e)}"
-            logger.error(error_msg)
-            span.update(level="ERROR")
-            return {"error": error_msg}
-        finally:
-            span.end()
+        return await lookup_weather(context, location, self.get_current_trace)
 
     @function_tool()
     async def identify_screen_elements(
         self,
         context: RunContext,
     ) -> Dict[str, Any]:
-        """Identify interactive elements and their exact positions on the user's screen.
-        
-        This tool analyzes the most recent screen capture to identify interactive elements along with their positions on screen.
+        """Identify interactive elements and their exact positions on the user's screen. 
+        Only use this tool if the actual position of an interactive element is needed. 
+        This tool is usually used to help navigation guidance/instructons generation.
         """
-        logger.info("Identifying interactive elements on screen")
+        return await identify_screen_elements(
+            context, 
+            self.frames, 
+            self.video_stream, 
+            self.session, 
+            self.get_current_trace
+        )
+
+    @function_tool()
+    async def display_navigation_guidance(
+        self,
+        context: RunContext,
+        instruction_text: str,
+        instruction_speech: str,
+        bounding_box: List[int],
+        visual_cue_type: str = "arrow"
+    ) -> Dict[str, Any]:
+        """Display navigation guidance with visual cues on the user's screen. Only use this tool after identifying screen elements.
         
-        # Create a span in Langfuse for tracking
-        span = self.get_current_trace().span(name="screen_element_identification")
+        Args:
+            instruction_text: Simple text instruction to display to the user, e.g. "Tap here"
+            instruction_speech: Spoken instruction to guide the user, e.g. "Tap the menu icon in the top right corner". This will be spoken automatically through TTS.
+            bounding_box: Bounding box coordinates originally from the identify_screen_elements tool
+            visual_cue_type: Type of visual cue to display (default: "arrow")
+        """
+        span = self.get_current_trace().span(
+            name="display_navigation_guidance",
+            metadata={
+                "instruction_text": instruction_text,
+                "instruction_speech": instruction_speech,
+                "bounding_box": bounding_box,
+                "visual_cue_type": visual_cue_type
+            }
+        )
         
         try:
-            # Check if we have any frames
-            if not self.frames and not self.video_stream:
-                logger.warning("No screen frames available")
-                return {
-                    "success": False,
-                    "error": "No screen sharing detected. Ask the user to share their screen.",
-                    "elements": []
-                }
-            
-            # Get the most recent frame
-            most_recent_frame = self.frames[-1] if self.frames else None
-            
-            if not most_recent_frame:
-                logger.warning("No recent frame available")
-                return {
-                    "success": False,
-                    "error": "No recent screen capture available. Ask the user to share their screen.",
-                    "elements": []
-                }            
+            logger.info(f"Instruction: {instruction_text}, {instruction_speech}")
+            logger.info(f"Bounding box: {bounding_box}")
+            logger.info(f"Visual cue type: {visual_cue_type}")
 
-            # tell the user that the agent is analyzing the screen, have to wait
-            self.session.say(
-                text="I am analyzing the screen... Please give me a minute..."
-            )
-
-            # Encode the VideoFrame to JPEG bytes
-            options = EncodeOptions(format="JPEG", quality=85)
-            image_bytes = encode(most_recent_frame, options)
-
-            # Encode as base64
-            image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-
-            # Initialize Gemini client
-            client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-            model = "gemini-2.5-flash-preview-05-20"
-
-            # Prepare the prompt
-            prompt = """Give the segmentation masks for the interactive components. Output a JSON list of segmentation masks where each entry contains the 2D bounding box in the key "box_2d", the segmentation mask in key "mask", and the text label in the key "label". Use descriptive labels."""
-
-            # Create content for Gemini
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_bytes(
-                            mime_type="image/jpeg",
-                            data=image_b64,
-                        ),
-                        types.Part.from_text(text=prompt),
-                    ],
-                ),
-            ]
-
-            span.update(input={"mime_type": "image/jpeg", "data": image_b64, "text": prompt})
-            
-            # Configure generation
-            generate_content_config = types.GenerateContentConfig(
-                max_output_tokens=4096,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                response_mime_type="text/plain",
-            )
-            
-            # Generate content
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=model,
-                contents=contents,
-                config=generate_content_config,
-            )
-            
-            # Process and structure the response
-            raw_analysis = response.text
-            
-            logger.info(f"Received Gemini analysis: {raw_analysis[:100]}...")
-            
-            # Filter out mask content from the response
-            filtered_elements = self.filter_mask_content(raw_analysis)
-            
-            return {
-                "success": True,
-                "elements": filtered_elements,
+            # Prepare the payload for the frontend
+            payload = {
+                "instruction_text": instruction_text,
+                "bounding_box": bounding_box,
+                "visual_cue_type": visual_cue_type,
                 "timestamp": datetime.now(UTC).isoformat()
             }
-            
+
+            # Get the first remote participant (assuming single user scenario)
+            remote_participants = list(self.room.remote_participants.values())
+            if not remote_participants:
+                logger.error("No remote participants found for navigation guidance")
+                span.update(level="ERROR")
+                return {
+                    "success": False,
+                    "error": "No remote participants available",
+                    "payload": payload
+                }
+
+            target_participant = remote_participants[0]
+            logger.info(f"Sending navigation guidance to participant: {target_participant.identity}")
+
+            try:
+                # Perform RPC call to frontend
+                response = await self.room.local_participant.perform_rpc(
+                    destination_identity=target_participant.identity,
+                    method="display-navigation-guidance",
+                    payload=json.dumps(payload),
+                    response_timeout=5.0  # 5 second timeout for UI operations
+                )
+                
+                # received by frontend, tts the instruction at the same time
+                logger.info(f"Navigation guidance RPC successful. Response: {response}")
+                self.session.say(instruction_speech)
+                span.update(level="DEFAULT")
+                
+                return {
+                    "success": True,
+                    "response": response,
+                    "payload": payload
+                }
+
+            except rtc.RpcError as rpc_error:
+                error_msg = f"RPC call failed: {rpc_error.code} - {rpc_error.message}"
+                logger.error(error_msg)
+                span.update(level="ERROR")
+                
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "error_code": rpc_error.code,
+                    "payload": payload
+                }
+
         except Exception as e:
-            error_msg = f"Screen element identification error: {str(e)}"
+            error_msg = f"Failed to display navigation guidance: {str(e)}"
             logger.error(error_msg)
             span.update(level="ERROR")
             return {
                 "success": False,
                 "error": error_msg,
-                "elements": []
+                "payload": payload if 'payload' in locals() else None
             }
         finally:
             span.end()
-
-    def filter_mask_content(self, raw_response: str) -> List[Dict[str, Any]]:
-        """Filter out the mask content from the Gemini API response.
-        
-        Args:
-            raw_response: The raw response text from Gemini API
-            
-        Returns:
-            List of dictionaries with filtered element data (no mask content)
-        """
-        try:
-            # Extract JSON content from the response (it might be wrapped in markdown code blocks)
-            json_content = raw_response
-            if "```json" in raw_response:
-                json_content = raw_response.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw_response:
-                json_content = raw_response.split("```")[1].strip()
-            
-            # Parse the JSON content
-            elements = json.loads(json_content)
-            
-            # Filter out mask content
-            filtered_elements = []
-            for element in elements:
-                filtered_element = {
-                    "box_2d": element.get("box_2d", []),
-                    "label": element.get("label", "Unknown element")
-                }
-                filtered_elements.append(filtered_element)
-            
-            logger.info(f"Filtered {len(filtered_elements)} UI elements from response")
-            return filtered_elements
-        except Exception as e:
-            logger.error(f"Error filtering mask content: {str(e)}")
-            return []
 
     async def close(self) -> None:
         await self.close_video_stream()
@@ -302,6 +241,11 @@ class VideoAgent(Agent):
         self.session.on("user_state_changed", self.on_user_state_change)
         self.session.on("agent_state_changed", self.on_agent_state_change)
         self.room.on("track_subscribed", self.on_track_subscribed)
+        self.room.on("participant_disconnected", self.on_participant_disconnected)
+        
+    async def on_participant_disconnected(self) -> None:
+        logger.info("Participant disconnected")
+        await self.close()
 
     async def on_exit(self) -> None:
         await self.session.generate_reply(
@@ -443,9 +387,9 @@ class VideoAgent(Agent):
         logger.info("Starting video frame capture")
         frame_count = 0
         async for event in video_stream:
-            # Capture frames at 1 per second
+            # Capture frames at 2 per second
             current_time = time.time()
-            if current_time - self.last_frame_time >= 1.0:
+            if current_time - self.last_frame_time >= 2.0:
                 # Store the frame and update time
                 frame = event.frame
                 self.frames.append(frame)
@@ -468,9 +412,9 @@ class VideoAgent(Agent):
                 current_frames.append(("first", self.frames[0]))
 
                 # For longer sequences (5+ frames), also include a middle frame
-                if len(self.frames) >= 5:
-                    mid_idx = len(self.frames) // 2
-                    current_frames.append(("middle", self.frames[mid_idx]))
+                #if len(self.frames) >= 5:
+                #    mid_idx = len(self.frames) // 2
+                #    current_frames.append(("middle", self.frames[mid_idx]))
         logger.info(f"Adding {len(current_frames)} frames to conversation (from {len(self.frames)} available)")
         # clear the frames after using them to avoid memory bloat
         self.frames = []
@@ -484,10 +428,10 @@ async def entrypoint(ctx: JobContext) -> None:
 
     logger.info(f"Connected to room: {ctx.room.name}")
     logger.info(f"Local participant: {ctx.room.local_participant.identity}")
-
-    if len(ctx.room.remote_participants) == 0:
-        logger.info("No remote participants in room, exiting")
-        return
+        
+    # Wait for a remote participant to join
+    await ctx.wait_for_participant()
+    logger.info("👤 Participant joined the room")
 
     logger.info(f"Found {len(ctx.room.remote_participants)} remote participants")
     # Create a simple agent session without custom frame rate
@@ -515,6 +459,11 @@ async def entrypoint(ctx: JobContext) -> None:
         room_input_options=room_input,
         room_output_options=room_output,
     )
+    
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant):
+        """Handle when a participant disconnected"""
+        logger.info(f"👋 Participant disconnected: {participant.identity}")
 
 
 if __name__ == "__main__":
