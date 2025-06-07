@@ -46,6 +46,7 @@ from PIL import Image
 # Import the tool functions
 from tools.lookup_weather import lookup_weather
 from tools.identify_screen_elements import identify_screen_elements
+from tools.display_navigation_guidance import display_navigation_guidance
 
 logger = logging.getLogger("openai-video-agent")
 logger.setLevel(logging.INFO)
@@ -141,86 +142,16 @@ class VideoAgent(Agent):
             bounding_box: Bounding box coordinates originally from the identify_screen_elements tool
             visual_cue_type: Type of visual cue to display (default: "arrow")
         """
-        span = self.get_current_trace().span(
-            name="display_navigation_guidance",
-            metadata={
-                "instruction_text": instruction_text,
-                "instruction_speech": instruction_speech,
-                "bounding_box": bounding_box,
-                "visual_cue_type": visual_cue_type
-            }
+        return await display_navigation_guidance(
+            context,
+            instruction_text,
+            instruction_speech,
+            bounding_box,
+            visual_cue_type,
+            self.session,
+            self.room,
+            self.get_current_trace
         )
-        
-        try:
-            logger.info(f"Instruction: {instruction_text}, {instruction_speech}")
-            logger.info(f"Bounding box: {bounding_box}")
-            logger.info(f"Visual cue type: {visual_cue_type}")
-
-            # Prepare the payload for the frontend
-            payload = {
-                "instruction_text": instruction_text,
-                "bounding_box": bounding_box,
-                "visual_cue_type": visual_cue_type,
-                "timestamp": datetime.now(UTC).isoformat()
-            }
-
-            # Get the first remote participant (assuming single user scenario)
-            remote_participants = list(self.room.remote_participants.values())
-            if not remote_participants:
-                logger.error("No remote participants found for navigation guidance")
-                span.update(level="ERROR")
-                return {
-                    "success": False,
-                    "error": "No remote participants available",
-                    "payload": payload
-                }
-
-            target_participant = remote_participants[0]
-            logger.info(f"Sending navigation guidance to participant: {target_participant.identity}")
-
-            try:
-                # Perform RPC call to frontend
-                response = await self.room.local_participant.perform_rpc(
-                    destination_identity=target_participant.identity,
-                    method="display-navigation-guidance",
-                    payload=json.dumps(payload),
-                    response_timeout=5.0  # 5 second timeout for UI operations
-                )
-                
-                # received by frontend, tts the instruction at the same time
-                logger.info(f"Navigation guidance RPC successful. Response: {response}")
-                self.session.say(instruction_speech)
-                span.update(level="DEFAULT")
-                
-                return {
-                    "success": True,
-                    "response": response,
-                    "payload": payload
-                }
-
-            except rtc.RpcError as rpc_error:
-                error_msg = f"RPC call failed: {rpc_error.code} - {rpc_error.message}"
-                logger.error(error_msg)
-                span.update(level="ERROR")
-                
-                return {
-                    "success": False,
-                    "error": error_msg,
-                    "error_code": rpc_error.code,
-                    "payload": payload
-                }
-
-        except Exception as e:
-            error_msg = f"Failed to display navigation guidance: {str(e)}"
-            logger.error(error_msg)
-            span.update(level="ERROR")
-            return {
-                "success": False,
-                "error": error_msg,
-                "payload": payload if 'payload' in locals() else None
-            }
-        finally:
-            span.end()
 
     async def close(self) -> None:
         await self.close_video_stream()
@@ -241,11 +172,6 @@ class VideoAgent(Agent):
         self.session.on("user_state_changed", self.on_user_state_change)
         self.session.on("agent_state_changed", self.on_agent_state_change)
         self.room.on("track_subscribed", self.on_track_subscribed)
-        self.room.on("participant_disconnected", self.on_participant_disconnected)
-        
-    async def on_participant_disconnected(self) -> None:
-        logger.info("Participant disconnected")
-        await self.close()
 
     async def on_exit(self) -> None:
         await self.session.generate_reply(
@@ -464,6 +390,7 @@ async def entrypoint(ctx: JobContext) -> None:
     def on_participant_disconnected(participant):
         """Handle when a participant disconnected"""
         logger.info(f"👋 Participant disconnected: {participant.identity}")
+        agent.close()
 
 
 if __name__ == "__main__":

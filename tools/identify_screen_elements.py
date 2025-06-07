@@ -150,15 +150,11 @@ def filter_mask_content(raw_response: str, span: Any) -> List[Dict[str, Any]]:
         # Parse the JSON content
         elements = json.loads(json_content)
         
-        # Filter out mask content and format bounding boxes
+        # Filter out mask content
         filtered_elements = []
         for element in elements:
-            # Get bounding box coordinates
-            box_2d = element.get("box_2d", [])
-            
-            # Create filtered element with only box_2d and label
             filtered_element = {
-                "box_2d": box_2d,  # Keep original format for compatibility
+                "box_2d": element.get("box_2d", []),
                 "label": element.get("label", "Unknown element")
             }
             filtered_elements.append(filtered_element)
