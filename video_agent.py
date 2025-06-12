@@ -7,7 +7,7 @@ import base64
 import os
 import json
 from datetime import UTC, datetime
-from typing import Union, AsyncIterable, Optional, List, Any, Dict
+from typing import Union, AsyncIterable, Optional, List, Any, Dict, Tuple
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -37,18 +37,20 @@ from livekit.agents import (
     RunContext,
 )
 from livekit.agents.llm import ImageContent, AudioContent
-from livekit.plugins import deepgram, openai, silero
+from livekit.plugins import deepgram, silero
+from livekit.plugins import google  # Change openai to google gemini
+from livekit.plugins.elevenlabs import TTS as ElevenLabsTTS
 from livekit.agents.utils.images.image import encode, EncodeOptions
 from livekit.agents.utils.images.image import ResizeOptions
-from livekit.plugins.turn_detector.english import EnglishModel
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from PIL import Image
 
 # Import the tool functions
 from tools.lookup_weather import lookup_weather
 from tools.identify_screen_elements import identify_screen_elements
-from tools.display_navigation_guidance import display_navigation_guidance
+from tools.display_instructions import display_instructions
 
-logger = logging.getLogger("openai-video-agent")
+logger = logging.getLogger("gemini-video-agent")
 logger.setLevel(logging.INFO)
 
 load_dotenv()
@@ -56,42 +58,59 @@ load_dotenv()
 _langfuse = Langfuse()
 
 INSTRUCTIONS = f"""
-You are a mobile voice assistant, Solus, who can answer general questions, help with app navigation, and answer questions about the user's screen. 
+You are a mobile voice assistant, Solus, designed for low-literate users in Malaysia who are not familiar with technology. 
+You can: 
+- answer general questions or make small talk, where user no need to share their screen, e.g. "Introduce yourself", "I see a brown cat today", ...
+- answer questions about the user's screen, e.g. "translate this text" while the current screen displays a news, "how can I answer this message politely" while the current screen displays user's chat history with someone, ...
+- provide guidance on how to use the mobile, e.g. "how to fill in this" while the current screen displays a application form in other language, "how to turn off this. the notification is annoying" while the current screen displays home screen with a lazada floating notification, ...
 
-User can share their screen to show you the issue. But sometimes they just want to talk to you.
+User query:
+- The user's voice query will be transcribed by STT. The STT transcription might not be accurate due to the accent/pronounciation.
+- User might also use informal or wrong words. 
+- If the transcription is not clear, try to guess user's intent based on the conversation history & current screen, and confirm with user.
 
-You have some powerful tools:
-- Look up weather information for a given location
-- Identify interactive UI elements and their positions on the screen to help with app navigation. When users ask for help navigating an app, you can use this tool to analyze the screen and guide them to specific buttons, fields, or other interactive elements by providing the position in the result of this tool.
-- Display navigation guidance with visual cues on the user's screen to help them navigate apps step by step.
+Screen context:
+- If user is sharing their screen, the screen history will be appended to the conversation history.
+- The screen history consists of the previous screen images, each are labeled in order.
+- The last screen in the history is the current user screen or what user is looking at.
 
-The tools might fail, tell the user if you fail to use the tool and provide another way to help them.
-IMPORTANT: Respond in plain text only. Do not use any markdown formatting including bold, italics, bullet points, numbered lists, or other markdown syntax. Your responses will be read aloud by text-to-speech.
+User need guidance:
+- If user need guidance, set a goal to help user with their query. 
+- Identify possible interactive components on user's current screen that can be used to achieve the goal.
+- Provide guidance step by step until the goal is achieved. Example of goal: User fill up the application and submitted, user changed the language, ...
+- During guidance, generate next step instructions to the user based on the current screen, and use the display_instructions function to show visual cues on the user's screen. 
+- When talking about an interactive component, actively use the display_instructions function to indicate the interactive component on the user's screen instead of just talking
+- Use the identify_screen_elements function to get the position of interactive components so that the visual cues can be displayed at the right position of user screen
+- After user follow the instructions, check the current screen and user response (if any) to see if the goal is achieved. Otherwise, continue to provide guidance.
+- Wrong instructions might be provided since you can only see the images, calming the user, be patient and provide corrective instructions. Example reply when wrong instructions are provided: "Sorry for the confusion, let me correct it"
 
-When screen sharing is available, state what you see briefly if you don't receive any query from user.
-
-If user's query need their screen context but no screen sharing is detected, let the user know they need to share their screen for visual assistance.
-
-Keep responses short, maximum 100 words while staying helpful and accurate.
-
-When providing navigation guidance, use the display_navigation_guidance tool to show visual cues on the user's screen alongside your spoken instructions.
+Response:
+- Keep responses short and concise, maximum 100 words
+- Use friendly tone and everyday language, don't use any technical terms
+- Respond in plain text only. Do not use any markdown formatting including bold, italics, bullet points, numbered lists, or other markdown syntax. Your responses will be read aloud by text-to-speech.
+- Don't mention the screen history in the response, user don't know what are them
 """
 
 class VideoAgent(Agent):
     def __init__(self, instructions: str, room: rtc.Room) -> None:
         super().__init__(
             instructions=instructions,
-            llm=openai.LLM(model="gpt-4.1-mini-2025-04-14"),
+            llm=google.LLM(
+                model="gemini-2.5-flash-preview-05-20",  # Using the latest Gemini model
+                temperature=0.8,
+            ),
             stt=deepgram.STT(),
-            tts=deepgram.TTS(),
+            tts=ElevenLabsTTS(voice_id="21m00Tcm4TlvDq8ikWAM"),
             vad=silero.VAD.load(),
-            turn_detection=EnglishModel(),
+            turn_detection=MultilingualModel(),
         )
         self.room = room
         self.session_id = str(uuid4())
         self.current_trace = None
 
-        self.frames: List[rtc.VideoFrame] = []
+        # Replace frames list with screen history and latest frame
+        self.screen_history: List[rtc.VideoFrame] = []
+        self.latest_frame: Optional[rtc.VideoFrame] = None
         self.last_frame_time: float = 0
         self.video_stream: Optional[rtc.VideoStream] = None
 
@@ -113,20 +132,19 @@ class VideoAgent(Agent):
         self,
         context: RunContext,
     ) -> Dict[str, Any]:
-        """Identify interactive elements and their exact positions on the user's screen. 
-        Only use this tool if the actual position of an interactive element is needed. 
-        This tool is usually used to help navigation guidance/instructons generation.
+        """Call this function to identify all the interactive components and their exact positions on the user's current screen. 
+        Useful in providing guidance. The result/ouput is usually being used to display instructions on the user's screen. 
+        The result/output of this function is success indicator, a list of bounding boxes with a descriptive label for each interactive component detected on the screen, and timestamp of the result. 
         """
         return await identify_screen_elements(
             context, 
-            self.frames, 
-            self.video_stream, 
+            self.latest_frame if self.latest_frame else None, 
             self.session, 
             self.get_current_trace
         )
 
     @function_tool()
-    async def display_navigation_guidance(
+    async def display_instructions(
         self,
         context: RunContext,
         instruction_text: str,
@@ -134,15 +152,17 @@ class VideoAgent(Agent):
         bounding_box: List[int],
         visual_cue_type: str = "arrow"
     ) -> Dict[str, Any]:
-        """Display navigation guidance with visual cues on the user's screen. Only use this tool after identifying screen elements.
+        """Call this function to display instructions visually on the user's screen. 
+        Usually only being used if the actual position of the target interactive component is known or from the result of the identify_screen_elements function. 
+        The result/output of this function is success indicator, a response to the user, and payload/content send to the user's phone.
         
         Args:
-            instruction_text: Simple text instruction to display to the user, e.g. "Tap here"
+            instruction_text: Simple text instruction than instruction_speech to display to the user, e.g. "Tap here"
             instruction_speech: Spoken instruction to guide the user, e.g. "Tap the menu icon in the top right corner". This will be spoken automatically through TTS.
-            bounding_box: Bounding box coordinates originally from the identify_screen_elements tool
+            bounding_box: Bounding box coordinates originally from the identify_screen_elements function
             visual_cue_type: Type of visual cue to display (default: "arrow")
         """
-        return await display_navigation_guidance(
+        return await display_instructions(
             context,
             instruction_text,
             instruction_speech,
@@ -152,6 +172,162 @@ class VideoAgent(Agent):
             self.room,
             self.get_current_trace
         )
+        
+    def calculate_frame_similarity(self, frame_data1: bytes, frame_data2: bytes) -> float:
+        """
+        Calculate similarity between two frames represented as JPEG byte data.
+        Returns a value between 0 and 1, where 1 means identical.
+        This is an optimized version that runs faster by using downsampling and simpler comparison.
+        """
+        try:
+            # Convert bytes to PIL Images
+            img1 = Image.open(io.BytesIO(frame_data1))
+            img2 = Image.open(io.BytesIO(frame_data2))
+            
+            # Resize images to much smaller dimensions for faster comparison (50x50 instead of 100x100)
+            size = (50, 50)
+            img1 = img1.resize(size)
+            img2 = img2.resize(size)
+            
+            # Convert to grayscale for simpler comparison
+            img1 = img1.convert('L')
+            img2 = img2.convert('L')
+            
+            # Get pixel data as arrays for faster processing
+            pixels1 = list(img1.getdata())
+            pixels2 = list(img2.getdata())
+            
+            # Calculate difference using a faster method - sample only a subset of pixels
+            if len(pixels1) != len(pixels2):
+                return 0.0  # Different sizes, consider completely different
+                
+            # Sample only every 4th pixel (reduces computation by 75%)
+            sample_rate = 4
+            sample_pixels1 = pixels1[::sample_rate]
+            sample_pixels2 = pixels2[::sample_rate]
+            
+            # Count matching pixels with tolerance
+            matches = 0
+            total_samples = len(sample_pixels1)
+            tolerance = 15  # Slightly increased tolerance to account for sampling
+            
+            for i in range(total_samples):
+                if abs(sample_pixels1[i] - sample_pixels2[i]) <= tolerance:
+                    matches += 1
+                    
+            # Calculate similarity ratio
+            similarity = matches / total_samples
+            
+            return similarity
+        except Exception as e:
+            logger.error(f"Error calculating frame similarity: {e}")
+            return 0.0  # On error, consider frames different
+
+    async def is_frame_different_enough(self, frame1: rtc.VideoFrame, frame2: rtc.VideoFrame) -> Tuple[bool, float]:
+        """
+        Check if two frames are different enough (less than 99% similar).
+        Returns a tuple of (is_different_enough, similarity_score).
+        Uses run_in_executor to avoid blocking the event loop.
+        """
+        try:
+            # Convert frames to bytes for comparison
+            frame1_data = encode(frame1, EncodeOptions(format="JPEG", quality=80))  # Reduced quality for faster encoding
+            frame2_data = encode(frame2, EncodeOptions(format="JPEG", quality=80))
+            
+            # Run the CPU-intensive similarity calculation in a thread pool
+            loop = asyncio.get_event_loop()
+            similarity = await loop.run_in_executor(
+                None, 
+                self.calculate_frame_similarity,
+                frame1_data, 
+                frame2_data
+            )
+            
+            # Check if frames are different enough (less than 99% similar)
+            is_different_enough = similarity < 0.99
+            
+            return (is_different_enough, similarity)
+        except Exception as e:
+            logger.error(f"Error comparing frames: {e}")
+            # On error, consider frames different
+            return (True, 0.0)
+
+    async def check_and_add_to_history_if_needed(self) -> bool:
+        """
+        Check if the latest frame is different enough from the last frame in history.
+        If so, or if history is empty, add it to history.
+        Returns True if frame was added, False otherwise.
+        """
+        if not self.latest_frame:
+            logger.debug("No latest frame available to check")
+            return False
+            
+        # Check if history is empty
+        if not self.screen_history:
+            # Add the first frame to history
+            self.screen_history.append(self.latest_frame)
+            logger.info("Added first screen to history")
+            return True
+            
+        # Compare with last frame in history
+        is_different, similarity = await self.is_frame_different_enough(
+            self.latest_frame, self.screen_history[-1]
+        )
+        
+        if is_different:
+            # Add to history if different enough
+            self.screen_history.append(self.latest_frame)
+            screen_number = len(self.screen_history)
+            logger.info(f"Added screen #{screen_number} to history (similarity: {similarity:.2f})")
+            return True
+        else:
+            logger.info(f"Current screen is too similar to last in history (similarity: {similarity:.2f}), not adding")
+            return False
+    
+    async def add_screen_to_history(
+        self,
+        context: RunContext
+    ) -> Dict[str, Any]:
+        """Call this function to add the current screen to the screen history.
+        This function is used when: 
+        - the current screen is different from the last screen in the history.
+        - there is no screen in the history yet.
+        The result/output of this function is success indicator, and a message.
+        """
+        span = self.get_current_trace().span(name="add_screen_to_history")
+        
+        try:
+            if not self.latest_frame:
+                logger.warning("No latest frame available to add to history")
+                span.update(level="WARNING")
+                return {
+                    "success": False,
+                    "message": "No screen is currently being shared."
+                }
+            
+            # Delegate to the helper method to check and add if needed
+            was_added = await self.check_and_add_to_history_if_needed()
+            
+            if was_added:
+                screen_number = len(self.screen_history)
+                return {
+                    "success": True,
+                    "message": f"Added screen #{screen_number} to history"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "Current screen is too similar to the last screen in history"
+                }
+        except Exception as e:
+            span.update(level="ERROR")
+            logger.error(f"Error adding screen to history: {e}")
+            return {
+                "success": False,
+                "message": f"Error adding screen to history: {e}"
+            }
+        finally:
+            span.end()
 
     async def close(self) -> None:
         await self.close_video_stream()
@@ -163,11 +339,12 @@ class VideoAgent(Agent):
         if self.video_stream:
             await self.video_stream.aclose()
             self.video_stream = None
+            self.latest_frame = None
 
     async def on_enter(self) -> None:
-        # Just generate a basic intro without video reference
+        # Greet user without video reference
         self.session.generate_reply(
-            instructions="introduce yourself very briefly and simply talk about what you have seen if you receive any screen content, not exceeding 20 words"
+            instructions="Greet the user. Additionally, simply talk about what you have seen if any, otherwise just greet. Don't exceed 15 words"
         )
         self.session.on("user_state_changed", self.on_user_state_change)
         self.session.on("agent_state_changed", self.on_agent_state_change)
@@ -230,33 +407,38 @@ class VideoAgent(Agent):
     ) -> AsyncIterable[llm.ChatChunk]:
 
         copied_ctx = chat_ctx.copy()
-        frames_to_use = self.current_frames()
+        
+        # Check if latest frame should be added to history
+        if self.latest_frame:
+            # Automatically check and add to history if needed
+            await self.check_and_add_to_history_if_needed()        
+        else:
+            # No frames available - user is not sharing their screen
+            copied_ctx.add_message(
+                role="system",
+                content="The user is not currently sharing their screen."
+            )
+            logger.warning("No captured frames available for this conversation")
 
-        if frames_to_use:
-            for position, frame in frames_to_use:
-                # Use the original frame for LLM context
+        # Add screen history to context
+        if self.screen_history:
+            for i, frame in enumerate(self.screen_history, 1):
                 image_content = ImageContent(
                     image=frame,
                     inference_detail="high"
                 )
                 copied_ctx.add_message(
                     role="user",
-                    content=[f"{position.title()} view of user during speech:", image_content]
+                    content=[f"Screen history: Screen {i}:", image_content]
                 )
-                logger.info(f"Added {position} frame to chat context")
-        else:
-            # No frames available - user is not sharing their screen
-            copied_ctx.add_message(
-                role="system",
-                content="The user is not currently sharing their screen. Let them know they need to share their screen for you to provide visual assistance."
-            )
-            logger.warning("No captured frames available for this conversation")
+                logger.info(f"Added Screen {i} to chat context")
 
-        messages = openai.utils.to_chat_ctx(copied_ctx, cache_key=self.llm)
+        # Convert to Google-compatible format using the google plugin's utility function
+        messages = google.utils.to_chat_ctx(copied_ctx, cache_key=self.llm)
         
         generation = self.get_current_trace().generation(
             name="llm_generation",
-            model="gpt-4.1-mini-2025-04-14",
+            model="gemini-2.0-flash-exp",
             input=messages,
         )
         output = ""
@@ -281,7 +463,7 @@ class VideoAgent(Agent):
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: ModelSettings
     ) -> AsyncIterable[rtc.AudioFrame]:
-        span = self.get_current_trace().span(name="tts_node", metadata={"model": "deepgram"})
+        span = self.get_current_trace().span(name="tts_node", metadata={"model": "elevenlabs"})
         try:
             async for event in Agent.default.tts_node(self, text, model_settings):
                 yield event
@@ -312,41 +494,59 @@ class VideoAgent(Agent):
 
         logger.info("Starting video frame capture")
         frame_count = 0
+        last_captured_frame = None  # Store the last captured frame for comparison
+        
         async for event in video_stream:
-            # Capture frames at 2 per second
+            # Capture frames at 1 per second
             current_time = time.time()
-            if current_time - self.last_frame_time >= 2.0:
-                # Store the frame and update time
-                frame = event.frame
-                self.frames.append(frame)
+            if current_time - self.last_frame_time >= 1.0:
+                # Get current frame
+                current_frame = event.frame
+                
+                # Process frame in background to avoid blocking
+                task = asyncio.create_task(self.process_new_frame(current_frame, last_captured_frame))
+                
+                # Update capture time immediately to maintain capture rate
                 self.last_frame_time = current_time
-
-                frame_count += 1
-                logger.info(f"Captured frame #{frame_count}: {frame.width}x{frame.height}")
-        logger.info(f"Video frame capture ended - captured {frame_count} frames")
-
-    def current_frames(self) -> List[rtc.VideoFrame]:
-        # Add strategic frames from the conversation to provide better context
-        # We'll use the first and last frames if available, plus a middle frame for longer sequences
-        current_frames = []
-        if len(self.frames) > 0:
-            # Always use the most recent frame
-            current_frames.append(("most recent", self.frames[-1]))
-
-            # For sequences with multiple frames, also include the first frame
-            if len(self.frames) >= 3:
-                current_frames.append(("first", self.frames[0]))
-
-                # For longer sequences (5+ frames), also include a middle frame
-                #if len(self.frames) >= 5:
-                #    mid_idx = len(self.frames) // 2
-                #    current_frames.append(("middle", self.frames[mid_idx]))
-        logger.info(f"Adding {len(current_frames)} frames to conversation (from {len(self.frames)} available)")
-        # clear the frames after using them to avoid memory bloat
-        self.frames = []
-        # return frames in reverse order so earliest frames appear first in context
-        return list(reversed(current_frames))
-
+                
+                # Wait for the task to complete to get the result
+                try:
+                    result = await task
+                    if result[0]:  # Frame was captured
+                        frame_count += 1
+                        last_captured_frame = result[1]
+                except Exception as e:
+                    logger.error(f"Error waiting for frame processing: {e}")
+                    
+        logger.info(f"Video frame capture ended - captured {frame_count} unique frames")
+    
+    async def process_new_frame(self, current_frame: rtc.VideoFrame, last_captured_frame: Optional[rtc.VideoFrame]) -> Tuple[bool, Optional[rtc.VideoFrame]]:
+        """
+        Process a new frame without blocking the main event loop
+        Returns: (was_frame_captured, frame_to_use_for_next_comparison)
+        """
+        try:
+            # Check if this frame is different from the last captured frame
+            is_different_enough = True
+            similarity = 0.0
+            
+            if last_captured_frame is not None:
+                # Use the helper method to check similarity
+                is_different_enough, similarity = await self.is_frame_different_enough(
+                    current_frame, last_captured_frame
+                )
+            
+            if is_different_enough:
+                # Update the latest frame
+                self.latest_frame = current_frame
+                logger.info(f"Captured new frame: {self.latest_frame.width}x{self.latest_frame.height} (similarity: {similarity:.2f})")
+                return (True, current_frame)  # Frame was captured, use it for future comparisons
+            else:
+                logger.debug(f"Skipped similar frame (similarity: {similarity:.2f})")
+                return (False, last_captured_frame)  # Frame was not captured, keep using the last one
+        except Exception as e:
+            logger.error(f"Error processing frame: {e}")
+            return (False, last_captured_frame)
 
 async def entrypoint(ctx: JobContext) -> None:
     # Connect to the room
@@ -390,7 +590,8 @@ async def entrypoint(ctx: JobContext) -> None:
     def on_participant_disconnected(participant):
         """Handle when a participant disconnected"""
         logger.info(f"👋 Participant disconnected: {participant.identity}")
-        agent.close()
+        # Use create_task to run the async close method
+        asyncio.create_task(agent.close())
 
 
 if __name__ == "__main__":
