@@ -13,8 +13,7 @@ logger = logging.getLogger("openai-video-agent")
 
 async def identify_screen_elements(
     context,
-    frames,
-    video_stream,
+    most_recent_frame,
     session,
     get_current_trace,
 ) -> Dict[str, Any]:
@@ -28,17 +27,6 @@ async def identify_screen_elements(
     span = get_current_trace().span(name="screen_element_identification")
     
     try:
-        # Check if we have any frames
-        if not frames and not video_stream:
-            logger.warning("No screen frames available")
-            return {
-                "success": False,
-                "error": "No screen sharing detected. Ask the user to share their screen.",
-                "elements": []
-            }
-        
-        # Get the most recent frame
-        most_recent_frame = frames[-1] if frames else None
         
         if not most_recent_frame:
             logger.warning("No recent frame available")
@@ -54,7 +42,7 @@ async def identify_screen_elements(
         )
 
         # Encode the VideoFrame to JPEG bytes
-        options = EncodeOptions(format="JPEG", quality=85)
+        options = EncodeOptions(format="JPEG", quality=95)
         image_bytes = encode(most_recent_frame, options)
 
         # Encode as base64
@@ -110,13 +98,31 @@ async def identify_screen_elements(
         elif "```" in raw_response:
             json_content = raw_response.split("```")[1].strip()
             
-        span.update(output={"interactive_ui_components": json_content})
-        
-        return {
-            "success": True,
-            "interactive_ui_components": json_content,
-            "timestamp": datetime.now(UTC).isoformat()
-        }
+        # Parse the JSON string into a Python structure
+        try:
+            # Parse the JSON content into a Python list of dictionaries
+            parsed_elements = json.loads(json_content)
+            
+            # Log the number of elements found
+            logger.info(f"Successfully parsed {len(parsed_elements)} UI elements from response")
+            
+            # Store both the raw JSON string and the parsed elements
+            span.update(output={"interactive_ui_components": parsed_elements})
+            
+            return {
+                "success": True,
+                "interactive_ui_components": parsed_elements,  # Return parsed Python objects instead of JSON string
+                "timestamp": datetime.now(UTC).isoformat()
+            }
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON response: {str(e)}")
+            span.update(level="ERROR", metadata={"json_parse_error": str(e), "raw_content": json_content})
+            return {
+                "success": False,
+                "error": f"Failed to parse screen elements: {str(e)}",
+                "raw_json": json_content,
+                "interactive_ui_components": []
+            }
         
     except Exception as e:
         error_msg = f"Screen element identification error: {str(e)}"

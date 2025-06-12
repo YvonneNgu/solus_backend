@@ -8,7 +8,7 @@ from langfuse.client import StatefulClient
 
 logger = logging.getLogger("openai-video-agent")
 
-async def display_navigation_guidance(
+async def display_instructions(
     context,
     instruction_text: str,
     instruction_speech: str,
@@ -31,7 +31,7 @@ async def display_navigation_guidance(
         get_current_trace: Function to get the current trace
     """
     span = get_current_trace().span(
-        name="display_navigation_guidance",
+        name="display_instructions",
         metadata={
             "instruction_text": instruction_text,
             "instruction_speech": instruction_speech,
@@ -78,7 +78,7 @@ async def display_navigation_guidance(
             
             # received by frontend, tts the instruction at the same time
             logger.info(f"Navigation guidance RPC successful. Response: {response}")
-            session.say(instruction_speech)
+            #session.say(instruction_speech)
             span.update(level="DEFAULT")
             
             return {
