@@ -114,6 +114,50 @@ class VideoAgent(Agent):
         self.last_frame_time: float = 0
         self.video_stream: Optional[rtc.VideoStream] = None
 
+    def format_messages_for_langfuse(self, chat_ctx: llm.ChatContext) -> List[Dict[str, Any]]:
+        """Convert ChatContext to Langfuse-friendly format for better readability"""
+        messages = []
+        
+        for msg in chat_ctx.items:
+            message_dict = {
+                "role": msg.role,
+                "content": []
+            }
+            
+            # Handle different content types
+            for content in msg.content:
+                if isinstance(content, str):
+                    message_dict["content"].append({
+                        "type": "text",
+                        "text": content
+                    })
+                elif isinstance(content, ImageContent):
+                    message_dict["content"].append({
+                        "type": "image",
+                        "text": "[Image content]"  # Simplified representation
+                    })
+                elif isinstance(content, AudioContent):
+                    message_dict["content"].append({
+                        "type": "audio",
+                        "text": "[Audio content]"  # Simplified representation
+                    })
+            
+            # If only one text content, simplify to just the text
+            if len(message_dict["content"]) == 1 and message_dict["content"][0].get("type") == "text":
+                message_dict["content"] = message_dict["content"][0]["text"]
+            
+            messages.append(message_dict)
+        
+        return messages
+
+    def extract_text_response(self, chunks: List[llm.ChatChunk]) -> str:
+        """Extract text response from chat chunks"""
+        response_text = ""
+        for chunk in chunks:
+            if chunk.delta and chunk.delta.content:
+                response_text += chunk.delta.content
+        return response_text
+
     @function_tool()
     async def lookup_weather(
         self,
@@ -415,7 +459,7 @@ class VideoAgent(Agent):
         else:
             # No frames available - user is not sharing their screen
             copied_ctx.add_message(
-                role="system",
+                role="user",
                 content="The user is not currently sharing their screen."
             )
             logger.warning("No captured frames available for this conversation")
@@ -433,16 +477,41 @@ class VideoAgent(Agent):
                 )
                 logger.info(f"Added Screen {i} to chat context")
 
-        # Convert to Google-compatible format using the google plugin's utility function
-        messages = google.utils.to_chat_ctx(copied_ctx, cache_key=self.llm)
+        # Enhanced Langfuse tracing
+        messages_for_langfuse = self.format_messages_for_langfuse(copied_ctx)
+        
+        # Debug: Print messages being sent to LLM
+        logger.info("===== MESSAGES SENT TO LLM (GEMINI) =====")
+        for msg in copied_ctx.items:
+            # For text content, print directly
+            if isinstance(msg.content, str):
+                logger.info(f"[{msg.role}]: {msg.content[:100]}..." if len(msg.content) > 100 else f"[{msg.role}]: {msg.content}")
+            # For list content (multimodal), print structure
+            elif isinstance(msg.content, list):
+                logger.info(f"[{msg.role}]: Multimodal message with {len(msg.content)} elements")
+                for i, element in enumerate(msg.content):
+                    if isinstance(element, str):
+                        logger.info(f"  - Text element {i}: {element[:50]}..." if len(element) > 50 else f"  - Text element {i}: {element}")
+                    else:
+                        logger.info(f"  - Image element {i}")
+        logger.info("=========================================")
         
         generation = self.get_current_trace().generation(
             name="llm_generation",
-            model="gemini-2.0-flash-exp",
-            input=messages,
+            model="gemini-2.5-flash-preview-05-20",
+            input=messages_for_langfuse,  # Use formatted messages
+            metadata={
+                "temperature": 0.8,
+                "has_screen_history": len(self.screen_history) > 0,
+                "screen_count": len(self.screen_history),
+                "has_latest_frame": self.latest_frame is not None
+            }
         )
+        
         output = ""
         set_completion_start_time = False
+        chunks = []
+        
         try:
             async for chunk in Agent.default.llm_node(self, copied_ctx, tools, model_settings):
                 if not set_completion_start_time:
@@ -452,13 +521,19 @@ class VideoAgent(Agent):
                     set_completion_start_time = True
                 if chunk.delta and chunk.delta.content:
                     output += chunk.delta.content
+                chunks.append(chunk)
                 yield chunk
         except Exception as e:
             generation.update(level="ERROR")
             logger.error(f"LLM error: {e}")
             raise
         finally:
-            generation.end(output=output)
+            # Create a simple output format for better readability
+            final_output = {
+                "role": "assistant",
+                "content": output
+            }
+            generation.end(output=final_output)
 
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: ModelSettings
