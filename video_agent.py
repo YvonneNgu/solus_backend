@@ -49,6 +49,8 @@ from PIL import Image
 from tools.lookup_weather import lookup_weather
 from tools.identify_screen_elements import identify_screen_elements
 from tools.display_instructions import display_instructions
+from livekit.agents import get_job_context
+from livekit import api
 
 logger = logging.getLogger("gemini-video-agent")
 logger.setLevel(logging.INFO)
@@ -84,6 +86,11 @@ User need guidance:
 - After user follow the instructions, check the current screen and user response (if any) to see if the goal is achieved. Otherwise, continue to provide guidance.
 - Wrong instructions might be provided since you can only see the images, calming the user, be patient and provide corrective instructions. Example reply when wrong instructions are provided: "Sorry for the confusion, let me correct it"
 
+Natural conversation ending:
+- If the user expresses satisfaction with the help provided, says goodbye, or indicates they're done, use the end_conversation function to naturally end the session.
+- Examples of when to end: "Thank you, that's all I need", "Goodbye", "I'm done", "That solved my problem, thanks"
+- Always confirm the user is satisfied before ending the conversation.
+
 Response:
 - Keep responses short and concise, maximum 100 words
 - Use friendly tone and everyday language, don't use any technical terms
@@ -101,6 +108,7 @@ class VideoAgent(Agent):
             ),
             stt=deepgram.STT(),
             tts=ElevenLabsTTS(voice_id="21m00Tcm4TlvDq8ikWAM"),
+            # tts=deepgram.TTS(),
             vad=silero.VAD.load(),
             turn_detection=MultilingualModel(),
         )
@@ -113,40 +121,82 @@ class VideoAgent(Agent):
         self.latest_frame: Optional[rtc.VideoFrame] = None
         self.last_frame_time: float = 0
         self.video_stream: Optional[rtc.VideoStream] = None
+        self._ending_conversation = False
 
     def format_messages_for_langfuse(self, chat_ctx: llm.ChatContext) -> List[Dict[str, Any]]:
         """Convert ChatContext to Langfuse-friendly format for better readability"""
         messages = []
         
-        for msg in chat_ctx.items:
-            message_dict = {
-                "role": msg.role,
-                "content": []
-            }
+        for item in chat_ctx.items:
+            # Check if the item has a role attribute (ChatMessage)
+            if hasattr(item, 'role'):
+                message_dict = {
+                    "role": item.role,
+                    "content": []
+                }
+                
+                # Handle different content types
+                for content in item.content:
+                    if isinstance(content, str):
+                        message_dict["content"].append({
+                            "type": "text",
+                            "text": content
+                        })
+                    elif isinstance(content, ImageContent):
+                        message_dict["content"].append({
+                            "type": "image",
+                            "text": "[Image content]"
+                        })
+                    elif isinstance(content, AudioContent):
+                        message_dict["content"].append({
+                            "type": "audio",
+                            "text": "[Audio content]"
+                        })
+                    # Handle function calls within content
+                    elif hasattr(content, 'function_call') and content.function_call:
+                        func_call = content.function_call
+                        func_text = f"Function call: {func_call.name}"
+                        if hasattr(func_call, 'args') and func_call.args:
+                            func_text += f" | Args: {str(func_call.args)[:100]}..."
+                        message_dict["content"].append({
+                            "type": "function_call",
+                            "text": func_text
+                        })
+                    # Handle function responses within content
+                    elif hasattr(content, 'function_response') and content.function_response:
+                        func_resp = content.function_response
+                        func_text = f"Function response: {func_resp.name}"
+                        if hasattr(func_resp, 'response') and func_resp.response:
+                            response_text = str(func_resp.response.text) if hasattr(func_resp.response, 'text') else str(func_resp.response)
+                            func_text += f" | Response: {response_text[:200]}..."
+                        message_dict["content"].append({
+                            "type": "function_response",
+                            "text": func_text
+                        })
+                
+                # If only one text content, simplify to just the text
+                if len(message_dict["content"]) == 1 and message_dict["content"][0].get("type") == "text":
+                    message_dict["content"] = message_dict["content"][0]["text"]
+                
+                messages.append(message_dict)
             
-            # Handle different content types
-            for content in msg.content:
-                if isinstance(content, str):
-                    message_dict["content"].append({
-                        "type": "text",
-                        "text": content
-                    })
-                elif isinstance(content, ImageContent):
-                    message_dict["content"].append({
-                        "type": "image",
-                        "text": "[Image content]"  # Simplified representation
-                    })
-                elif isinstance(content, AudioContent):
-                    message_dict["content"].append({
-                        "type": "audio",
-                        "text": "[Audio content]"  # Simplified representation
-                    })
+            # Handle standalone FunctionCall objects
+            elif hasattr(item, 'name'):  # FunctionCall has 'name' attribute
+                message_dict = {
+                    "role": "function",
+                    "content": f"Function call: {item.name}"
+                }
+                if hasattr(item, 'args') and item.args:
+                    message_dict["content"] += f" | Args: {str(item.args)[:100]}..."
+                messages.append(message_dict)
             
-            # If only one text content, simplify to just the text
-            if len(message_dict["content"]) == 1 and message_dict["content"][0].get("type") == "text":
-                message_dict["content"] = message_dict["content"][0]["text"]
-            
-            messages.append(message_dict)
+            # Handle other unknown types gracefully
+            else:
+                message_dict = {
+                    "role": "unknown",
+                    "content": f"[Unknown message type: {type(item).__name__}]"
+                }
+                messages.append(message_dict)
         
         return messages
 
@@ -177,8 +227,8 @@ class VideoAgent(Agent):
         context: RunContext,
     ) -> Dict[str, Any]:
         """Call this function to identify all the interactive components and their exact positions on the user's current screen. 
-        Useful in providing guidance. The result/ouput is usually being used to display instructions on the user's screen. 
-        The result/output of this function is success indicator, a list of bounding boxes with a descriptive label for each interactive component detected on the screen, and timestamp of the result. 
+        Useful in providing guidance. The result/output is usually being used to display instructions on the user's screen. 
+        The result/output of this function are a success indicator, a list of bounding boxes with a descriptive label for each interactive component detected on the screen, and timestamp of the result. 
         """
         return await identify_screen_elements(
             context, 
@@ -216,6 +266,36 @@ class VideoAgent(Agent):
             self.room,
             self.get_current_trace
         )
+
+    @function_tool()
+    async def end_conversation(self, context: RunContext, farewell_message: str = None) -> None:
+        """Use this tool to naturally end the conversation when the user indicates they're done or satisfied with the help provided.
+        
+        Args:
+            farewell_message: custom closing message to say to the user before ending the session
+        """
+        try:
+            # Set a flag to indicate we're ending the conversation
+            self._ending_conversation = True
+            
+            # Use default farewell if none provided
+            if not farewell_message:
+                farewell_message = "Thank you for using Solus. Have a wonderful day!"
+            
+            # Say goodbye before ending using session.say()
+            await self.session.say(farewell_message)
+            logger.info("Said goodbye")
+            
+            # Get job context and end the room
+            job_ctx = get_job_context()
+            
+            # Delete the room which will disconnect all participants
+            logger.info("Deleting room")
+            await job_ctx.api.room.delete_room(api.DeleteRoomRequest(room=job_ctx.room.name))
+            logger.info("Room deleted")
+            
+        except Exception as e:
+            logger.error(f"Error ending conversation: {e}")
         
     def calculate_frame_similarity(self, frame_data1: bytes, frame_data2: bytes) -> float:
         """
@@ -374,10 +454,17 @@ class VideoAgent(Agent):
             span.end()
 
     async def close(self) -> None:
-        await self.close_video_stream()
-        if self.current_trace:
-            self.current_trace = None
-        _langfuse.flush()
+        try:
+            await self.close_video_stream()
+        except Exception as e:
+            logger.error(f"Error closing video stream: {e}")
+        
+        try:
+            if self.current_trace:
+                self.current_trace = None
+            _langfuse.flush()
+        except Exception as e:
+            logger.error(f"Error flushing langfuse: {e}")
 
     async def close_video_stream(self) -> None:
         if self.video_stream:
@@ -395,9 +482,6 @@ class VideoAgent(Agent):
         self.room.on("track_subscribed", self.on_track_subscribed)
 
     async def on_exit(self) -> None:
-        await self.session.generate_reply(
-            instructions="tell the user a friendly goodbye before you exit",
-        )
         await self.close()
 
     def get_current_trace(self) -> StatefulClient:
@@ -479,22 +563,62 @@ class VideoAgent(Agent):
 
         # Enhanced Langfuse tracing
         messages_for_langfuse = self.format_messages_for_langfuse(copied_ctx)
-        
+
         # Debug: Print messages being sent to LLM
         logger.info("===== MESSAGES SENT TO LLM (GEMINI) =====")
         for msg in copied_ctx.items:
-            # For text content, print directly
-            if isinstance(msg.content, str):
-                logger.info(f"[{msg.role}]: {msg.content[:100]}..." if len(msg.content) > 100 else f"[{msg.role}]: {msg.content}")
-            # For list content (multimodal), print structure
-            elif isinstance(msg.content, list):
-                logger.info(f"[{msg.role}]: Multimodal message with {len(msg.content)} elements")
-                for i, element in enumerate(msg.content):
-                    if isinstance(element, str):
-                        logger.info(f"  - Text element {i}: {element[:50]}..." if len(element) > 50 else f"  - Text element {i}: {element}")
+            try:
+                # Check if the item has a role attribute (ChatMessage)
+                if hasattr(msg, 'role'):
+                    # For text content, print directly
+                    if isinstance(msg.content, str):
+                        logger.info(f"[{msg.role}]: {msg.content[:100]}..." if len(msg.content) > 100 else f"[{msg.role}]: {msg.content}")
+                    # For list content (multimodal), print structure
+                    elif isinstance(msg.content, list):
+                        logger.info(f"[{msg.role}]: Multimodal message with {len(msg.content)} elements")
+                        for i, element in enumerate(msg.content):
+                            if isinstance(element, str):
+                                logger.info(f"  - Text element {i}: {element[:50]}..." if len(element) > 50 else f"  - Text element {i}: {element}")
+                            elif hasattr(element, 'function_call') and element.function_call:
+                                func_call = element.function_call
+                                func_info = f"Function call: {func_call.name}"
+                                if hasattr(func_call, 'args') and func_call.args:
+                                    func_info += f" | Args: {str(func_call.args)[:50]}..."
+                                logger.info(f"  - Function call element {i}: {func_info}")
+                            elif hasattr(element, 'function_response') and element.function_response:
+                                func_resp = element.function_response
+                                func_info = f"Function response: {func_resp.name}"
+                                if hasattr(func_resp, 'response') and func_resp.response:
+                                    response_text = str(func_resp.response.text) if hasattr(func_resp.response, 'text') else str(func_resp.response)
+                                    func_info += f" | Response: {response_text[:100]}..."
+                                logger.info(f"  - Function response element {i}: {func_info}")
+                            else:
+                                logger.info(f"  - Other element {i}: {type(element).__name__}")
+                    # Handle empty or None content
                     else:
-                        logger.info(f"  - Image element {i}")
+                        logger.info(f"[{msg.role}]: [No content or unsupported content type]")
+                
+                # Handle standalone FunctionCall objects
+                elif hasattr(msg, 'name'):  # FunctionCall has 'name' attribute
+                    function_info = f"Function call: {msg.name}"
+                    if hasattr(msg, 'args') and msg.args:
+                        function_info += f" | Args: {str(msg.args)[:50]}..."
+                    logger.info(f"[function]: {function_info}")
+                
+                # Handle other unknown types gracefully
+                else:
+                    logger.info(f"[unknown]: {type(msg).__name__} object")
+                    
+            except AttributeError as e:
+                logger.warning(f"Error accessing message attributes: {e} - Type: {type(msg).__name__}")
+            except Exception as e:
+                logger.error(f"Unexpected error processing debug message: {e}")
+
         logger.info("=========================================")
+
+        if self._ending_conversation:
+            logger.info("Ending conversation")
+            return
         
         generation = self.get_current_trace().generation(
             name="llm_generation",
@@ -665,8 +789,6 @@ async def entrypoint(ctx: JobContext) -> None:
     def on_participant_disconnected(participant):
         """Handle when a participant disconnected"""
         logger.info(f"👋 Participant disconnected: {participant.identity}")
-        # Use create_task to run the async close method
-        asyncio.create_task(agent.close())
 
 
 if __name__ == "__main__":
