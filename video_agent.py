@@ -123,6 +123,13 @@ class VideoAgent(Agent):
         self.video_stream: Optional[rtc.VideoStream] = None
         self._ending_conversation = False
 
+        # For improved screen handling
+        self.is_on_different_screen = True  # Flag to track if user moved to different screen
+        self.screen_positions = {}  # Maps screen frame to its position in chat history
+        self.last_user_message_position = 0  # Track last user message position
+        self.consecutive_captures = []  # Track consecutive frame captures for consistency
+        self.last_consistent_frame = None  # Store the last consistent frame
+
     def format_messages_for_langfuse(self, chat_ctx: llm.ChatContext) -> List[Dict[str, Any]]:
         """Convert ChatContext to Langfuse-friendly format for better readability"""
         messages = []
@@ -528,43 +535,47 @@ class VideoAgent(Agent):
             span.end()
 
     async def llm_node(
-        self,
-        chat_ctx: llm.ChatContext,
-        tools: List[FunctionTool],
-        model_settings: ModelSettings
+    self,
+    chat_ctx: llm.ChatContext,
+    tools: List[FunctionTool],
+    model_settings: ModelSettings
     ) -> AsyncIterable[llm.ChatChunk]:
 
         copied_ctx = chat_ctx.copy()
+        dif_screen = self.is_on_different_screen
         
-        # Check if latest frame should be added to history
-        if self.latest_frame:
-            # Automatically check and add to history if needed
-            await self.check_and_add_to_history_if_needed()        
-        else:
-            # No frames available - user is not sharing their screen
+        # Handle screen sharing logic
+        if not self.latest_frame:
+            # User is not sharing screen
             copied_ctx.add_message(
                 role="user",
-                content="The user is not currently sharing their screen."
+                content="User is not currently sharing their screen."
             )
-            logger.warning("No captured frames available for this conversation")
-
-        # Add screen history to context
-        if self.screen_history:
-            for i, frame in enumerate(self.screen_history, 1):
-                image_content = ImageContent(
-                    image=frame,
-                    inference_detail="high"
-                )
-                copied_ctx.add_message(
-                    role="user",
-                    content=[f"Screen history: Screen {i}:", image_content]
-                )
-                logger.info(f"Added Screen {i} to chat context")
+            logger.info("Added 'not sharing screen' message to context")
+        else:
+            # User is sharing screen
+            if self.is_on_different_screen:
+                # User moved to a different screen - record new position and add frame
+                await self.record_new_screen_position(copied_ctx)
+                self.is_on_different_screen = False
+            
+            # Always re-insert all recorded screen frames at their positions
+            await self.insert_all_screen_frames(copied_ctx)
+            
+            # If user is on the same screen, add informational message (one-time use)
+            if not dif_screen:
+                screen_number = self.get_screen_number_for_frame(self.latest_frame)
+                if screen_number:
+                    copied_ctx.add_message(
+                        role="user",
+                        content=f"User is on the same screen: screen {screen_number}"
+                    )
+                    logger.info(f"Added 'same screen' message for screen {screen_number}")
 
         # Enhanced Langfuse tracing
         messages_for_langfuse = self.format_messages_for_langfuse(copied_ctx)
 
-        # Debug: Print messages being sent to LLM
+        ## Debug: Print messages being sent to LLM
         logger.info("===== MESSAGES SENT TO LLM (GEMINI) =====")
         for msg in copied_ctx.items:
             try:
@@ -623,12 +634,12 @@ class VideoAgent(Agent):
         generation = self.get_current_trace().generation(
             name="llm_generation",
             model="gemini-2.5-flash-preview-05-20",
-            input=messages_for_langfuse,  # Use formatted messages
+            input=messages_for_langfuse,
             metadata={
                 "temperature": 0.8,
-                "has_screen_history": len(self.screen_history) > 0,
-                "screen_count": len(self.screen_history),
-                "has_latest_frame": self.latest_frame is not None
+                "has_latest_frame": self.latest_frame is not None,
+                "is_different_screen": self.is_on_different_screen,
+                "screen_positions_count": len(self.screen_positions)
             }
         )
         
@@ -639,9 +650,7 @@ class VideoAgent(Agent):
         try:
             async for chunk in Agent.default.llm_node(self, copied_ctx, tools, model_settings):
                 if not set_completion_start_time:
-                    generation.update(
-                        completion_start_time=datetime.now(UTC),
-                    )
+                    generation.update(completion_start_time=datetime.now(UTC))
                     set_completion_start_time = True
                 if chunk.delta and chunk.delta.content:
                     output += chunk.delta.content
@@ -652,12 +661,197 @@ class VideoAgent(Agent):
             logger.error(f"LLM error: {e}")
             raise
         finally:
-            # Create a simple output format for better readability
-            final_output = {
-                "role": "assistant",
-                "content": output
-            }
+            final_output = {"role": "assistant", "content": output}
             generation.end(output=final_output)
+
+    async def record_new_screen_position(self, chat_ctx: llm.ChatContext) -> None:
+        """Record the position where a new screen should be inserted."""
+        try:
+            # Find the position after the last user message by searching from the end
+            insertion_position = len(chat_ctx.items)  # Default: insert at the end
+            
+            # Search from the end to find the last user message faster
+            for i in range(len(chat_ctx.items) - 1, -1, -1):
+                item = chat_ctx.items[i]
+                if hasattr(item, 'role') and item.role == 'user':
+                    # Position after the last user message + account for existing screens
+                    insertion_position = i + 1 + len(self.screen_positions)
+                    logger.info(f"Insertion position: {insertion_position}")
+                    break
+            
+            frame_id = id(self.latest_frame)
+            screen_number = len(self.screen_positions) + 1
+            
+            # Record the position for this frame
+            self.screen_positions[frame_id] = {
+                'frame': self.latest_frame,  # Store the actual frame
+                'insertion_position': insertion_position,
+                'screen_number': screen_number,
+                'timestamp': time.time()
+            }
+            
+            logger.info(f"Recorded new screen position: Screen {screen_number} at position {insertion_position} (frame_id: {frame_id})")
+            
+        except Exception as e:
+            logger.error(f"Error recording new screen position: {e}")
+
+    async def insert_all_screen_frames(self, chat_ctx: llm.ChatContext) -> None:
+        """Insert all recorded screen frames at their correct positions in every iteration."""
+        try:
+            if not self.screen_positions:
+                return
+            
+            # Sort screen positions by their insertion order to maintain correct positioning
+            sorted_screens = sorted(
+                self.screen_positions.items(),
+                key=lambda x: x[1]['screen_number']  # Sort by screen number for consistent ordering
+            )
+            
+            # Create a new chat context to rebuild with screens inserted
+            new_chat_ctx = []
+            
+            # Track positions in original and new context
+            first_ctx_position = 0
+            new_ctx_position = 0
+            
+            # Process each screen to insert
+            for i in range(len(sorted_screens)):
+                frame_id, screen_info = sorted_screens[i]
+                
+                # Calculate where this screen should be inserted in the new context
+                new_ctx_position = screen_info['insertion_position'] - i
+                
+                # Add original items up to the insertion point
+                for j in range(first_ctx_position, new_ctx_position):
+                    if j < len(chat_ctx.items):
+                        new_chat_ctx.append(chat_ctx.items[j])
+                
+                # Create and insert the screen message
+                frame = screen_info['frame']
+                screen_number = screen_info['screen_number']
+                
+                # Create image content
+                image_content = ImageContent(
+                    image=frame,
+                    inference_detail="high"
+                )
+                
+                # Create screen message
+                screen_message = ChatMessage(
+                    role="user",
+                    content=[f"Screen {screen_number}:", image_content]
+                )
+                
+                # Add the screen to the new context
+                new_chat_ctx.append(screen_message)
+                logger.debug(f"Inserted Screen {screen_number} at position {len(new_chat_ctx)-1}")
+                
+                # Update the first context position to continue after this insertion point
+                first_ctx_position = new_ctx_position
+            
+            # Add any remaining items from the original context
+            if first_ctx_position < len(chat_ctx.items):
+                for j in range(first_ctx_position, len(chat_ctx.items)):
+                    new_chat_ctx.append(chat_ctx.items[j])
+            
+            # Replace the original context items with our new rebuilt context
+            chat_ctx.items.clear()
+            for item in new_chat_ctx:
+                chat_ctx.items.append(item)
+            
+            logger.info(f"Inserted {len(sorted_screens)} screen frames into context")
+            
+        except Exception as e:
+            logger.error(f"Error inserting screen frames: {e}")
+
+    def get_screen_number_for_frame(self, frame: rtc.VideoFrame) -> Optional[int]:
+        """Get the screen number for a given frame if it exists in position tracking."""
+        frame_id = id(frame)
+        if frame_id in self.screen_positions:
+            return self.screen_positions[frame_id]['screen_number']
+        return None
+
+    async def add_new_screen_to_context(self, chat_ctx: llm.ChatContext) -> None:
+        """Add a new screen frame to the chat context at the appropriate position."""
+        try:
+            if not self.latest_frame:
+                logger.warning("No latest frame available to add to context")
+                return
+                
+            # Check if this frame already exists in our position tracking
+            frame_id = id(self.latest_frame)  # Use frame object id as identifier
+            
+            if frame_id in self.screen_positions:
+                logger.info("Frame already exists in context, skipping addition")
+                return
+            
+            # Calculate insertion position
+            # Find the actual position of user messages in the current context
+            user_message_positions = []
+            for i, item in enumerate(chat_ctx.items):
+                if hasattr(item, 'role') and item.role == 'user':
+                    user_message_positions.append(i)
+            
+            # Insert after the last user message, accounting for existing screens
+            if user_message_positions:
+                base_position = user_message_positions[-1] + 1
+            else:
+                base_position = len(chat_ctx.items)
+            
+            # Account for existing screens that were already inserted
+            insertion_position = base_position + len(self.screen_positions)
+            screen_number = len(self.screen_positions) + 1
+            
+            # Create image content
+            image_content = ImageContent(
+                image=self.latest_frame,
+                inference_detail="high"
+            )
+            
+            # Create the message with screen content
+            screen_content = [f"Current screen (Screen {screen_number}):", image_content]
+            
+            # Insert into context - but we need to be careful about the ChatContext structure
+            # Since we can't directly insert into ChatContext.items, we'll add it normally
+            # and track it for future reference
+            chat_ctx.add_message(
+                role="user",
+                content=screen_content
+            )
+            
+            # Record the position for this frame (approximate position)
+            self.screen_positions[frame_id] = {
+                'position': len(chat_ctx.items) - 1,  # Position where we just added it
+                'screen_number': screen_number,
+                'timestamp': time.time()
+            }
+            
+            logger.info(f"Added Screen {screen_number} to context (frame_id: {frame_id})")
+            
+        except Exception as e:
+            logger.error(f"Error adding new screen to context: {e}")
+
+    def get_screen_number_for_frame(self, frame: rtc.VideoFrame) -> Optional[int]:
+        """Get the screen number for a given frame if it exists in position tracking."""
+        frame_id = id(frame)
+        if frame_id in self.screen_positions:
+            return self.screen_positions[frame_id]['screen_number']
+        return None
+
+    def cleanup_old_screen_positions(self, max_age_seconds: int = 300) -> None:
+        """Clean up old screen position records to prevent memory leaks."""
+        current_time = time.time()
+        to_remove = []
+        
+        for frame_id, info in self.screen_positions.items():
+            if current_time - info['timestamp'] > max_age_seconds:
+                to_remove.append(frame_id)
+        
+        for frame_id in to_remove:
+            del self.screen_positions[frame_id]
+            
+        if to_remove:
+            logger.info(f"Cleaned up {len(to_remove)} old screen position records")
 
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: ModelSettings
@@ -687,38 +881,115 @@ class VideoAgent(Agent):
         asyncio.create_task(self.read_video_stream(rtc.VideoStream(track)))
 
     async def read_video_stream(self, video_stream: rtc.VideoStream) -> None:
-        # close open streams
         await self.close_video_stream()
         self.video_stream = video_stream
 
         logger.info("Starting video frame capture")
         frame_count = 0
-        last_captured_frame = None  # Store the last captured frame for comparison
+        total_frames_received = 0
         
         async for event in video_stream:
-            # Capture frames at 1 per second
+            total_frames_received += 1
             current_time = time.time()
-            if current_time - self.last_frame_time >= 1.0:
-                # Get current frame
+            time_diff = current_time - self.last_frame_time
+            
+            if time_diff >= 1.0:  # Capture frames at 1 per second
                 current_frame = event.frame
                 
-                # Process frame in background to avoid blocking
-                task = asyncio.create_task(self.process_new_frame(current_frame, last_captured_frame))
-                
-                # Update capture time immediately to maintain capture rate
+                # Process frame for consistency
+                task = asyncio.create_task(self.process_frame_with_consistency(current_frame))
                 self.last_frame_time = current_time
                 
-                # Wait for the task to complete to get the result
                 try:
                     result = await task
-                    if result[0]:  # Frame was captured
+                    if result:  # Frame was accepted as consistent
                         frame_count += 1
-                        last_captured_frame = result[1]
+                        # Mark as different screen when we get a new consistent frame
+                        self.is_on_different_screen = True
+                        logger.info(f"New consistent screen detected - marked as different (accepted frame {frame_count})")
                 except Exception as e:
-                    logger.error(f"Error waiting for frame processing: {e}")
+                    logger.error(f"Error processing frame: {e}")
                     
-        logger.info(f"Video frame capture ended - captured {frame_count} unique frames")
+        logger.info(f"Video frame capture ended - received {total_frames_received} total frames, accepted {frame_count} frames")
     
+    async def process_frame_with_consistency(self, current_frame: rtc.VideoFrame) -> bool:
+        """
+        Process frame with consistency checking to avoid capturing transitional/blurry frames.
+        Returns True if frame is accepted as consistent, False otherwise.
+        """
+        try:
+            # Handle the very first frame
+            if self.last_consistent_frame is None:
+                logger.info("Processing first frame - accepting immediately")
+                self.latest_frame = current_frame
+                self.last_consistent_frame = current_frame
+                self.consecutive_captures = []  # Clear any existing captures
+                return True
+            
+            # Check if this frame is different from the last consistent frame
+            is_different_enough, similarity = await self.is_frame_different_enough(
+                current_frame, self.last_consistent_frame
+            )
+            
+            logger.debug(f"Frame similarity check: different_enough={is_different_enough}, similarity={similarity:.3f}")
+            
+            if is_different_enough:
+                # This is a different frame - add to consecutive captures
+                self.consecutive_captures.append({
+                    'frame': current_frame,
+                    'timestamp': time.time()
+                })
+                logger.debug(f"Added frame to consecutive captures (total: {len(self.consecutive_captures)})")
+                
+                # If we have only 1 capture, we need to wait for more to confirm consistency
+                # But if we have been waiting too long (>5 seconds), accept what we have
+                if len(self.consecutive_captures) == 1:
+                    first_capture_time = self.consecutive_captures[0]['timestamp']
+                    if time.time() - first_capture_time < 2.0:  # Wait up to 2 seconds for confirmation
+                        logger.debug("Waiting for consistency confirmation...")
+                        return False
+                    else:
+                        logger.info("Timeout waiting for consistency - accepting single capture")
+                
+                # Accept the frame if we have multiple consecutive captures or timeout
+                consistent_frame = self.consecutive_captures[-1]['frame']
+                self.latest_frame = consistent_frame
+                self.last_consistent_frame = consistent_frame
+                
+                capture_count = len(self.consecutive_captures)
+                logger.info(f"Accepted consistent frame from {capture_count} consecutive captures (similarity from last: {similarity:.3f})")
+                
+                # Clear consecutive captures
+                self.consecutive_captures = []
+                return True
+                
+            else:
+                # This frame is similar to the last consistent frame
+                logger.debug(f"Frame is similar to last consistent frame (similarity: {similarity:.3f})")
+                
+                # If we have pending consecutive captures, this similarity indicates 
+                # the screen has stabilized, so we should accept the last capture
+                if len(self.consecutive_captures) > 0:
+                    consistent_frame = self.consecutive_captures[-1]['frame']
+                    self.latest_frame = consistent_frame
+                    self.last_consistent_frame = consistent_frame
+                    
+                    capture_count = len(self.consecutive_captures)
+                    logger.info(f"Screen stabilized - accepted consistent frame from {capture_count} consecutive captures")
+                    
+                    # Clear consecutive captures
+                    self.consecutive_captures = []
+                    return True
+                
+                # No pending captures and similar frame - just skip
+                return False
+            
+        except Exception as e:
+            logger.error(f"Error in frame consistency processing: {e}")
+            # On error, clear consecutive captures and don't accept frame
+            self.consecutive_captures = []
+            return False
+
     async def process_new_frame(self, current_frame: rtc.VideoFrame, last_captured_frame: Optional[rtc.VideoFrame]) -> Tuple[bool, Optional[rtc.VideoFrame]]:
         """
         Process a new frame without blocking the main event loop
