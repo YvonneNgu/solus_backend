@@ -9,22 +9,17 @@ from google import genai
 from google.genai import types
 from livekit.agents.utils.images.image import encode, EncodeOptions
 
-logger = logging.getLogger("openai-video-agent")
+logger = logging.getLogger("IDENTIFY ELEMENT TOOL")
 
 async def identify_screen_elements(
-    context,
     most_recent_frame,
     session,
-    get_current_trace,
 ) -> Dict[str, Any]:
     """Identify interactive elements and their exact positions on the user's screen.
     
     This tool analyzes the most recent screen capture to identify interactive elements along with their positions on screen.
     """
     logger.info("Identifying interactive elements on screen")
-    
-    # Create a span in Langfuse for tracking
-    span = get_current_trace().span(name="screen_element_identification")
     
     try:
         
@@ -50,7 +45,7 @@ async def identify_screen_elements(
 
         # Initialize Gemini client
         client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        model = "gemini-2.5-flash-preview-05-20"
+        model = "gemini-2.5-flash"
 
         # Update prompt to match the style used in the TypeScript code
         prompt = """Give the segmentation masks for the interactive components. Output a JSON list of segmentation masks where each entry contains the 2D bounding box in the key "box_2d", and the text label in the key "label". Use descriptive labels. Do not return masks."""
@@ -68,8 +63,6 @@ async def identify_screen_elements(
                 ],
             ),
         ]
-
-        span.update(input={"mime_type": "image/jpeg", "data": image_b64[:50], "text": prompt})
         
         # Configure generation
         generate_content_config = types.GenerateContentConfig(
@@ -106,9 +99,6 @@ async def identify_screen_elements(
             # Log the number of elements found
             logger.info(f"Successfully parsed {len(parsed_elements)} UI elements from response")
             
-            # Store both the raw JSON string and the parsed elements
-            span.update(output={"interactive_ui_components": parsed_elements})
-            
             return {
                 "success": True,
                 "interactive_ui_components": parsed_elements,  # Return parsed Python objects instead of JSON string
@@ -116,7 +106,6 @@ async def identify_screen_elements(
             }
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response: {str(e)}")
-            span.update(level="ERROR", metadata={"json_parse_error": str(e), "raw_content": json_content})
             return {
                 "success": False,
                 "error": f"Failed to parse screen elements: {str(e)}",
@@ -127,16 +116,13 @@ async def identify_screen_elements(
     except Exception as e:
         error_msg = f"Screen element identification error: {str(e)}"
         logger.error(error_msg)
-        span.update(level="ERROR")
         return {
             "success": False,
             "error": error_msg,
             "interactive_ui_components": []
         }
-    finally:
-        span.end()
 
-def filter_mask_content(raw_response: str, span: Any) -> List[Dict[str, Any]]:
+def filter_mask_content(raw_response: str) -> List[Dict[str, Any]]:
     """Filter out the mask content from the Gemini API response.
     
     Args:
@@ -169,5 +155,4 @@ def filter_mask_content(raw_response: str, span: Any) -> List[Dict[str, Any]]:
         return filtered_elements
     except Exception as e:
         logger.error(f"Error filtering mask content: {str(e)}")
-        span.update(level="ERROR", metadata=raw_response)
         return []

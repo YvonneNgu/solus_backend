@@ -4,19 +4,15 @@ from datetime import UTC, datetime
 from typing import Dict, List, Any
 
 from livekit import rtc
-from langfuse.client import StatefulClient
 
-logger = logging.getLogger("openai-video-agent")
+logger = logging.getLogger("DISPLAY INSTRUCTIONS")
 
 async def display_instructions(
-    context,
     instruction_text: str,
     instruction_speech: str,
     bounding_box: List[int],
     visual_cue_type: str,
-    session,
     room,
-    get_current_trace
 ) -> Dict[str, Any]:
     """Display navigation guidance with visual cues on the user's screen.
     
@@ -30,15 +26,6 @@ async def display_instructions(
         room: The LiveKit room
         get_current_trace: Function to get the current trace
     """
-    span = get_current_trace().span(
-        name="display_instructions",
-        metadata={
-            "instruction_text": instruction_text,
-            "instruction_speech": instruction_speech,
-            "bounding_box": bounding_box,
-            "visual_cue_type": visual_cue_type
-        }
-    )
     
     try:
         logger.info(f"Instruction: {instruction_text}, {instruction_speech}")
@@ -57,7 +44,6 @@ async def display_instructions(
         remote_participants = list(room.remote_participants.values())
         if not remote_participants:
             logger.error("No remote participants found for navigation guidance")
-            span.update(level="ERROR")
             return {
                 "success": False,
                 "error": "No remote participants available",
@@ -79,7 +65,6 @@ async def display_instructions(
             # received by frontend, tts the instruction at the same time
             logger.info(f"Navigation guidance RPC successful. Response: {response}")
             #session.say(instruction_speech)
-            span.update(level="DEFAULT")
             
             return {
                 "success": True,
@@ -90,7 +75,6 @@ async def display_instructions(
         except rtc.RpcError as rpc_error:
             error_msg = f"RPC call failed: {rpc_error.code} - {rpc_error.message}"
             logger.error(error_msg)
-            span.update(level="ERROR")
             
             return {
                 "success": False,
@@ -102,11 +86,8 @@ async def display_instructions(
     except Exception as e:
         error_msg = f"Failed to display navigation guidance: {str(e)}"
         logger.error(error_msg)
-        span.update(level="ERROR")
         return {
             "success": False,
             "error": error_msg,
             "payload": payload if 'payload' in locals() else None
         }
-    finally:
-        span.end()

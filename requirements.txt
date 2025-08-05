@@ -1,6 +1,7 @@
 livekit-api
-livekit-agents[google,silero,deepgram,turn-detector]
+livekit-agents[google,silero,deepgram,turn-detector,elevenlabs]
 python-dotenv
 fastapi
 uvicorn
-langfuse
+langfuse<3.0.0
+pillow
