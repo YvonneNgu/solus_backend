@@ -47,7 +47,7 @@ async def display_instructions(
             return {
                 "success": False,
                 "error": "No remote participants available",
-                "payload": payload
+                "instructions": "User has leave the conversation. Do nothing. The conversation will close automatically later."
             }
 
         target_participant = remote_participants[0]
@@ -69,7 +69,7 @@ async def display_instructions(
             return {
                 "success": True,
                 "response": response,
-                "payload": payload
+                "instructions": "Sucessfully display instructions on user screen. Wait for user to perform an action."
             }
 
         except rtc.RpcError as rpc_error:
@@ -79,8 +79,7 @@ async def display_instructions(
             return {
                 "success": False,
                 "error": error_msg,
-                "error_code": rpc_error.code,
-                "payload": payload
+                "instructions": "Fail to display instructions on user screen, try providing clearer verbal guidance instead. "
             }
 
     except Exception as e:
@@ -89,5 +88,5 @@ async def display_instructions(
         return {
             "success": False,
             "error": error_msg,
-            "payload": payload if 'payload' in locals() else None
+            "instructions": "Fail to display instructions on user screen, try providing clearer verbal guidance instead. "
         }

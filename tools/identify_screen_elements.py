@@ -27,13 +27,12 @@ async def identify_screen_elements(
             logger.warning("No recent frame available")
             return {
                 "success": False,
-                "error": "No recent screen capture available. Ask the user to share their screen.",
-                "elements": []
+                "error": "No recent screen capture available. Ask the user to share their screen."
             }            
 
         # tell the user that the agent is analyzing the screen, have to wait
         session.say(
-            text="I am analyzing the screen... Please give me a minute..."
+            text="I am analyzing the screen... "
         )
 
         # Encode the VideoFrame to JPEG bytes
@@ -102,15 +101,13 @@ async def identify_screen_elements(
             return {
                 "success": True,
                 "interactive_ui_components": parsed_elements,  # Return parsed Python objects instead of JSON string
-                "timestamp": datetime.now(UTC).isoformat()
+                "instructions": "Successfully get the interactive UI elements' position on the user screen. Use the data to display instructions during guidance. "
             }
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response: {str(e)}")
             return {
                 "success": False,
-                "error": f"Failed to parse screen elements: {str(e)}",
-                "raw_json": json_content,
-                "interactive_ui_components": []
+                "error": f"Failed to parse screen elements: {str(e)}. Apologize to the user that you faced an error and you will try to identify screen elements again."
             }
         
     except Exception as e:
@@ -118,8 +115,7 @@ async def identify_screen_elements(
         logger.error(error_msg)
         return {
             "success": False,
-            "error": error_msg,
-            "interactive_ui_components": []
+            "error": f"{error_msg}. Apologize to the user that you faced an error and you will try to identify screen elements again."
         }
 
 def filter_mask_content(raw_response: str) -> List[Dict[str, Any]]:

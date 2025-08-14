@@ -42,6 +42,8 @@ from livekit.plugins import google  # Change openai to google gemini
 from livekit.plugins.elevenlabs import TTS as ElevenLabsTTS
 from livekit.agents.utils.images.image import encode, EncodeOptions
 from livekit.agents.utils.images.image import ResizeOptions
+from livekit.agents import get_job_context
+from livekit import api
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from PIL import Image
 
@@ -49,8 +51,8 @@ from PIL import Image
 from tools.lookup_weather import lookup_weather as lookup_weather_tool
 from tools.identify_screen_elements import identify_screen_elements as identify_screen_elements_tool
 from tools.display_instructions import display_instructions as display_instructions_tool
-from livekit.agents import get_job_context
-from livekit import api
+
+from frame_observer import FrameObserver
 
 logger = logging.getLogger("multi-agent-system")
 logger.setLevel(logging.INFO)
@@ -121,9 +123,14 @@ class BaseVideoAgent(Agent):
         self._tasks = []  # Track async tasks
         self.is_on_different_screen = True  # Flag to track if user moved to different screen
         self.screen_number = 0  # Track current screen number
+        
+        self.frame_observer = FrameObserver(self) # observe frame change
 
     async def close(self) -> None:
         try:
+            # ensure stop observing frame change
+            await self.frame_observer.stop_observation()
+            
             # Cancel all tasks
             for task in self._tasks:
                 if not task.done():
@@ -133,7 +140,7 @@ class BaseVideoAgent(Agent):
             
             await self.close_video_stream()
         except Exception as e:
-            logger.error(f"Error closing video stream: {e}")
+            logger.error(f"Error closing agent: {e}")
         
         try:
             if self.current_trace:
@@ -205,8 +212,9 @@ class BaseVideoAgent(Agent):
 
         dif_screen = self.is_on_different_screen
         logger.info("Is on different screen: %s", dif_screen)
+        logger.info("Latest frame exists: %s", bool(self.latest_frame))
         
-        if not self.latest_frame:
+        if self.latest_frame is None:
             # User is not sharing screen: add message to inform llm
             chat_ctx.add_message(
                 role="user",
@@ -294,27 +302,6 @@ class BaseVideoAgent(Agent):
     
     def print_chat_context(self, chat_ctx: llm.ChatContext) -> None:
         """Debug method to print chat context being sent to LLM"""
-        
-        # Print raw chat_ctx for debugging - convert to dict/list for better readability
-        logger.info("===== RAW CHAT CONTEXT =====")
-        try:
-            # Try to access the items and convert to a more readable format
-            raw_items = []
-            for item in chat_ctx.items:
-                item_dict = {}
-                for attr in dir(item):
-                    if not attr.startswith('_'):
-                        try:
-                            value = getattr(item, attr)
-                            if not callable(value):
-                                item_dict[attr] = value
-                        except:
-                            pass
-                raw_items.append(item_dict)
-            logger.info(f"Raw chat_ctx items: {raw_items}")
-        except Exception as e:
-            logger.info(f"Raw chat_ctx: {chat_ctx} (Error accessing items: {e})")
-        logger.info("=============================")
         
         logger.info("===== CHAT CONTEXT SENT TO LLM (GEMINI) =====")
         for i, item in enumerate(chat_ctx.items):
@@ -661,24 +648,32 @@ Response guidelines:
                     chat_ctx=self.session.current_agent.chat_ctx.copy()  # Pass current chat context
                 )
                 
-                # Transfer video stream state to navigation agent
+                # Transfer basic frame state (but not the video stream itself)
                 navigation_agent.latest_frame = self.latest_frame
                 navigation_agent.last_frame_time = self.last_frame_time
-                navigation_agent.video_stream = self.video_stream
-                navigation_agent._tasks = self._tasks  # Transfer tasks
                 navigation_agent.is_on_different_screen = self.is_on_different_screen
                 navigation_agent.screen_number = self.screen_number
                 
-                # Don't close video stream on current agent since we're transferring it
-                self.video_stream = None  # Remove reference to prevent double closure
-                self._tasks = []  # Clear tasks reference
+                # Get the current video track from the existing stream
+                current_track = None
+                if self.video_stream:
+                    current_track = self.video_stream._track
+                    logger.info("Found existing video track for transfer")
                 
-                logger.info("Transferred video stream state to navigation agent")
+                # Close the current video stream properly
+                await self.close_video_stream()
+                
+                # Create new video stream for navigation agent if we have a track
+                if current_track:
+                    navigation_agent._create_video_stream(current_track)
+                    logger.info("Created new video stream for navigation agent")
+                
+                logger.info("Successfully handed off to navigation agent")
                 
                 span.update(output={"success": True, "goal": goal})
                 
-                # Return message and new agent
-                return f"I'll help you {goal}. Let me guide you step by step.", navigation_agent
+                # Return new agent
+                return navigation_agent
                 
             except Exception as e:
                 span.update(level="ERROR", status_message=str(e))
@@ -708,7 +703,32 @@ Response guidelines:
                 await context.session.say(farewell_message)
                 logger.info("Said goodbye")
                 
+                # Code to close UI for user (frontend app) using RPC
                 job_ctx = get_job_context()
+                room = job_ctx.room
+                remote_participants = list(room.remote_participants.values())
+
+                if remote_participants:
+                    target_participant = remote_participants[0]
+                    logger.info(f"Sending close UI command to participant: {target_participant.identity}")
+                    
+                    try:
+                        # Perform RPC call to close frontend UI
+                        response = await room.local_participant.perform_rpc(
+                            destination_identity=target_participant.identity,
+                            method="close-voice-assistant",
+                            payload="",
+                            response_timeout=5.0
+                        )
+                        logger.info(f"Close UI RPC successful. Response: {response}")
+                        
+                    except rtc.RpcError as rpc_error:
+                        logger.error(f"Close UI RPC call failed: {rpc_error.code} - {rpc_error.message}")
+                    except Exception as e:
+                        logger.error(f"Error sending close UI command: {str(e)}")
+                else:
+                    logger.warning("No remote participants found to send close UI command")
+                
                 logger.info("Deleting room")
                 await job_ctx.api.room.delete_room(api.DeleteRoomRequest(room=job_ctx.room.name))
                 logger.info("Room deleted")
@@ -751,12 +771,25 @@ Remember: You can only succeed when the user achieves the goal: {goal}
         super().__init__(
             instructions=instructions,
             room=room,
-            chat_ctx=chat_ctx,  # Preserve conversation context
-            tools=[lookup_weather]  # Will add navigation-specific tools below  
+            chat_ctx=chat_ctx   # Preserve conversation context
         )
         
         self.goal = goal
-        self._display_instructions_available = False
+        
+        self.identified = False
+        self.display_active = False
+        # Start observation (screen changes)
+        asyncio.create_task(self._start_observation())
+        
+    async def _start_observation(self):
+        """Start observation once the agent is fully initialized"""
+        # Small delay to ensure everything is set up
+        await asyncio.sleep(0.1)
+        
+        logger.info("Starting continuous frame observation from init")
+        await self.frame_observer.start_observation(
+            on_change_callback=self._on_screen_change
+        )
 
     async def on_enter(self) -> None:
         await self.session.generate_reply(
@@ -776,6 +809,13 @@ Remember: You can only succeed when the user achieves the goal: {goal}
         with langfuse.start_as_current_span(
             name="identify_screen_elements_tool"
         ) as span:
+            logger.info("Identified: %s", self.identified)
+            if self.identified:
+                # Already identified, no need to identify again
+                return {
+                    "success": False, 
+                    "error": "The UI elements have been identified, refer to the last identify_screen_elements function call result."
+                }
             try:
                 result = await identify_screen_elements_tool(
                     self.latest_frame if self.latest_frame else None,
@@ -783,9 +823,9 @@ Remember: You can only succeed when the user achieves the goal: {goal}
                 )
                 
                 # Add display_instructions tool after successful identification
-                if result.get('success', True) and not self._display_instructions_available:
-                    logger.info("Adding display_instructions tool to navigation agent")
-                    await self.add_display_instructions_tool()
+                if result.get('success') is True:
+                    self.identified = True
+                    logger.info("Set value of Identified to: %s", self.identified)
                 
                 span.update(output=result)
                 return result
@@ -794,45 +834,95 @@ Remember: You can only succeed when the user achieves the goal: {goal}
                 span.update(level="ERROR", status_message=str(e))
                 raise
 
-    async def add_display_instructions_tool(self):
-        """Add the display_instructions tool to the agent."""
-        if not self._display_instructions_available:
-            @function_tool()
-            async def display_instructions(
-                context: RunContext,
-                instruction_text: str,
-                instruction_speech: str,
-                bounding_box: List[int],
-                visual_cue_type: str = "arrow"
-            ) -> Dict[str, Any]:
-                """Display instructions visually on the user's screen with voice guidance."""
-                with langfuse.start_as_current_span(
-                    name="display_instructions",
-                    input={
-                        "instruction_text": instruction_text,
-                        "instruction_speech": instruction_speech,
-                        "bounding_box": bounding_box,
-                        "visual_cue_type": visual_cue_type
-                    }
-                ) as span:
-                    
-                    result = await display_instructions_tool(
-                        instruction_text,
-                        instruction_speech,
-                        bounding_box,
-                        visual_cue_type,
-                        self.room,
-                    )
-                    span.update(output=result)
-                    
-                    if not result.get('success', False):
-                        span.update(level="ERROR")
-                    return result
+    @function_tool()
+    async def display_instructions(
+        self,
+        context: RunContext,
+        instruction_text: str,
+        instruction_speech: str,
+        bounding_box: List[int],
+        visual_cue_type: str = "arrow"
+    ) -> Dict[str, Any]:
+        """Display instructions visually on the user's screen with voice guidance."""
+        with langfuse.start_as_current_span(
+            name="display_instructions",
+            input={
+                "instruction_text": instruction_text,
+                "instruction_speech": instruction_speech,
+                "bounding_box": bounding_box,
+                "visual_cue_type": visual_cue_type
+            }
+        ) as span:
+            if not self.identified:
+                # must identify before display instructions
+                return {
+                    "success": False,
+                    "error": "Not yet getting the actual position of target UI element. Call identify_screen_elements instead."
+                }
             
-            # Add the tool to the existing tools list
-            await self.update_tools(self.tools + [display_instructions])
-            self._display_instructions_available = True
-            logger.info("Added display_instructions tool to navigation agent")
+            result = await display_instructions_tool(
+                instruction_text,
+                instruction_speech,
+                bounding_box,
+                visual_cue_type,
+                self.room,
+            )
+            
+            # Start frame observation after successful display
+            if result.get('success') is True:                
+                self.display_active = True
+                logger.info("Display is active")
+            else:
+                span.update(level="ERROR")
+                
+            span.update(output=result)
+            
+            return result
+            
+    async def _on_screen_change(self):
+        """Single callback that handles all screen change scenarios"""
+        logger.info("Screen changed - handling based on current state")
+        
+        # If display is active, stop it (user followed instruction)
+        if self.display_active:
+            logger.info("User followed the instruction - stopping display")
+            await self.stop_display_instructions()
+            self.display_active = False
+        
+        # Always reset identification when screen changes
+        if self.identified:
+            logger.info("Screen changed - resetting identified flag")
+            self.identified = False
+            
+    async def stop_display_instructions(self) -> None:
+        """Send RPC to stop display instructions at frontend"""
+        try:
+            job_ctx = get_job_context()
+            room = job_ctx.room
+            remote_participants = list(room.remote_participants.values())
+
+            if remote_participants: # check if there is any user
+                target_participant = remote_participants[0]
+                logger.info(f"Stop display UI. Participant: {target_participant.identity}")
+                
+                try:
+                    response = await room.local_participant.perform_rpc(
+                        destination_identity=target_participant.identity,
+                        method="clear-navigation-guidance",
+                        payload="",
+                        response_timeout=3.0
+                    )
+                    logger.info(f"Stop display successful. Response: {response}")
+                    
+                except rtc.RpcError as rpc_error:
+                    logger.error(f"Stop display RPC failed: {rpc_error.code} - {rpc_error.message}")
+                except Exception as e:
+                    logger.error(f"Error sending stop display command: {str(e)}")
+            else:
+                logger.warning("No remote participants found to send stop display command")
+                
+        except Exception as e:
+            logger.error(f"Error stopping display instructions: {e}")
 
     @function_tool()
     async def hand_back_to_conversation(
@@ -851,6 +941,9 @@ Remember: You can only succeed when the user achieves the goal: {goal}
         ) as span:
             try:
                 logger.info(f"Handing back to conversation agent. Goal achieved: {self.goal}")
+                
+                # Stop any active frame observation before transfer
+                await self.frame_observer.stop_observation()
                 
                 # Mark goal as achieved
                 context.userdata.goal_achieved = True
