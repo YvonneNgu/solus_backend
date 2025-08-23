@@ -101,6 +101,7 @@ class BaseVideoAgent(Agent):
             instructions=instructions,
             llm=google.LLM(
                 model="gemini-2.5-flash",
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
                 temperature=0.8,
             ),
             stt=google.STT(),
@@ -214,18 +215,20 @@ class BaseVideoAgent(Agent):
         logger.info("Is on different screen: %s", dif_screen)
         logger.info("Latest frame exists: %s", bool(self.latest_frame))
         
+        # Handle screen state and messages
         if self.latest_frame is None:
-            # User is not sharing screen: add message to inform llm
-            chat_ctx.add_message(
+            # User is not sharing screen: create copy and add temporary message
+            temp_chat_ctx = chat_ctx.copy()
+            temp_chat_ctx.add_message(
                 role="user",
                 content="User is not currently sharing their screen."
             )
-            logger.info("Added 'not sharing screen' message to context")
+            logger.info("Added 'not sharing screen' temporary message to context")
         else:
             # User is sharing screen: check if user is on dif screen
             if dif_screen:
                 # User moved to a different screen: 
-                # - add latest screen frame
+                # - add latest screen frame to PERMANENT context
                 # - reset flag
                 self.screen_number += 1
                 
@@ -233,23 +236,28 @@ class BaseVideoAgent(Agent):
                     image=self.latest_frame
                 )
                 
+                # Add to PERMANENT context (this should persist)
                 chat_ctx.add_message(
                     role="user",
                     content=[f"Screen {self.screen_number}:", image_content]
                 )
-                logger.info(f"Added screen {self.screen_number} frame to context")
+                logger.info(f"Added screen {self.screen_number} frame to permanent context")
+                
+                # Create copy after adding to permanent context (so copy includes the new screen)
+                temp_chat_ctx = chat_ctx.copy()
                 
                 self.is_on_different_screen = False
             else:
-                # user is on the same screen: add message to inform llm
-                chat_ctx.add_message(
+                # user is on the same screen: create copy and add TEMPORARY message
+                temp_chat_ctx = chat_ctx.copy()
+                temp_chat_ctx.add_message(
                     role="user",
                     content=f"User is on the same screen: screen {self.screen_number}"
                 )
-                logger.info(f"Added 'same screen' message for screen {self.screen_number}")
+                logger.info(f"Added 'same screen' temporary message for screen {self.screen_number}")
 
-        # Print chat context for debugging
-        self.print_chat_context(chat_ctx)
+        # Print chat context for debugging (use temp context)
+        self.print_chat_context(temp_chat_ctx)
 
         if self._ending_conversation:
             logger.info("Ending conversation")
@@ -259,7 +267,7 @@ class BaseVideoAgent(Agent):
         with langfuse.start_as_current_generation(
             name="llm_generation",
             model="gemini-2.5-flash",
-            input=chat_ctx.to_provider_format('google'),
+            input=temp_chat_ctx.to_provider_format('google'),
             metadata={
                 "temperature": 0.8,
                 "is_sharing_screen": self.latest_frame is not None,
@@ -276,7 +284,8 @@ class BaseVideoAgent(Agent):
             start_time = time.time()
             
             try:
-                async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                # Use temporary context for LLM call, but pass original context for Agent methods
+                async for chunk in Agent.default.llm_node(self, temp_chat_ctx, tools, model_settings):
                     if not set_completion_start_time:
                         generation.update(completion_start_time=datetime.now(UTC))
                         set_completion_start_time = True
@@ -295,7 +304,8 @@ class BaseVideoAgent(Agent):
                 logger.info("response_time = %d", time.time() - start_time)
                 
                 if self.latest_frame and dif_screen:
-                    await self.update_chat_ctx(chat_ctx) # modify context directly to put image inside chat_ctx
+                    await self.update_chat_ctx(chat_ctx) # modify internal context to put image inside chat_ctx
+                    logger.info("Update chat ctx")
                 
                 final_output = {"role": "assistant", "content": output}
                 generation.update(output=final_output)
@@ -486,6 +496,8 @@ class BaseVideoAgent(Agent):
                     
                     if time_diff >= 1.0:  # Capture frames at 1 per second
                         current_frame = event.frame
+                        logger.info("testing")
+                        frame_start = time.time()
                         
                         if self.latest_frame is None:
                             self.latest_frame = current_frame
@@ -493,19 +505,27 @@ class BaseVideoAgent(Agent):
                             logger.info("Set first frame as latest frame")
                             frame_count += 1
                         else:
-                            is_different, similarity = await self.is_frame_different_enough(
-                                current_frame, self.latest_frame
-                            )
-                            
-                            if is_different:
-                                self.latest_frame = current_frame
-                                self.is_on_different_screen = True  # Mark as different screen
-                                frame_count += 1
-                                logger.info(f"New frame detected (similarity: {similarity:.2f}) - marked as different")
-                            else:
-                                logger.debug(f"Frame similar to latest frame (similarity: {similarity:.2f})")
+                            try:
                                 
+                                # Direct buffer comparison (no encoding needed - faster)
+                                if current_frame.data != self.latest_frame.data:
+                                    # different frame
+                                    self.latest_frame = current_frame
+                                    self.is_on_different_screen = True
+                                    logger.info("New frame detected")
+                                    frame_count += 1
+                                else:
+                                    # same frame
+                                    logger.info("Skipped - same frame")
+                                
+                            except Exception as e:
+                                logger.error(f"Error comparing frames: {e}")
+                                return (True, "error")
+                               
                         self.last_frame_time = current_time
+                                                
+                        frame_end = time.time()
+                        logger.info(f"Frame processing took {frame_end - frame_start:.3f}s")
                         
             except Exception as e:
                 logger.error(f"Error in video stream: {e}")
@@ -573,6 +593,23 @@ class BaseVideoAgent(Agent):
         except Exception as e:
             logger.error(f"Error comparing frames: {e}")
             return (True, 0.0)
+        
+    async def is_frame_different_enough2(self, frame1: rtc.VideoFrame, frame2: rtc.VideoFrame) -> Tuple[bool, str]:
+        """Fast frame comparison using direct buffer comparison."""
+        try:
+            # Quick property check
+            if (frame1.width != frame2.width or 
+                frame1.height != frame2.height or
+                frame1.format != frame2.format):
+                return (True, "different_dimensions")
+            
+            # Direct buffer comparison (no encoding needed!)
+            is_different = frame1.data != frame2.data
+            return (is_different, "identical" if not is_different else "different")
+            
+        except Exception as e:
+            logger.error(f"Error comparing frames: {e}")
+            return (True, "error")
 
 # Conversation Agent - handles general questions and decides when to hand off
 class ConversationAgent(BaseVideoAgent):
@@ -703,6 +740,7 @@ Response guidelines:
                 await context.session.say(farewell_message)
                 logger.info("Said goodbye")
                 
+                #add code here
                 # Code to close UI for user (frontend app) using RPC
                 job_ctx = get_job_context()
                 room = job_ctx.room
@@ -754,7 +792,7 @@ Your role is to:
 Process for each step:
 1. Use identify_screen_elements to get current screen layout
 2. Use display_instructions to show visual cues for the next action
-3. Wait for user to follow the instruction
+3. Wait for user to follow the instruction. Assume user follow the instruction when they are on a different screen. 
 4. Check if goal is achieved or continue to next step
 
 Response guidelines:
@@ -764,7 +802,10 @@ Response guidelines:
 - Say "Sorry for the confusion, let me correct it" when providing corrections
 - End guidance when goal is achieved
 
-Remember: You can only succeed when the user achieves the goal: {goal}
+Remember: 
+- You can only succeed when the user achieves the goal: {goal}
+- If user want to stop the guiding process, speak nothing and hand back to conversation agent
+- When handing back, don't mention because user think you are one. 
 """
 
         # NavigationAgent tools: identify_screen_elements, display_instructions, hand_back_to_conversation
@@ -778,18 +819,8 @@ Remember: You can only succeed when the user achieves the goal: {goal}
         
         self.identified = False
         self.display_active = False
-        # Start observation (screen changes)
-        asyncio.create_task(self._start_observation())
         
-    async def _start_observation(self):
-        """Start observation once the agent is fully initialized"""
-        # Small delay to ensure everything is set up
-        await asyncio.sleep(0.1)
-        
-        logger.info("Starting continuous frame observation from init")
-        await self.frame_observer.start_observation(
-            on_change_callback=self._on_screen_change
-        )
+
 
     async def on_enter(self) -> None:
         await self.session.generate_reply(
@@ -814,7 +845,7 @@ Remember: You can only succeed when the user achieves the goal: {goal}
                 # Already identified, no need to identify again
                 return {
                     "success": False, 
-                    "error": "The UI elements have been identified, refer to the last identify_screen_elements function call result."
+                    "error": "The UI elements and their position data already exists, refer to the last identify_screen_elements function response in the chat context."
                 }
             try:
                 result = await identify_screen_elements_tool(
@@ -822,10 +853,13 @@ Remember: You can only succeed when the user achieves the goal: {goal}
                     context.session
                 )
                 
-                # Add display_instructions tool after successful identification
+                # after successful identification, mark as identified
                 if result.get('success') is True:
                     self.identified = True
                     logger.info("Set value of Identified to: %s", self.identified)
+                    
+                    # Don't start observation here - let display_instructions handle it
+                    logger.info("Screen elements identified successfully")
                 
                 span.update(output=result)
                 return result
@@ -843,7 +877,14 @@ Remember: You can only succeed when the user achieves the goal: {goal}
         bounding_box: List[int],
         visual_cue_type: str = "arrow"
     ) -> Dict[str, Any]:
-        """Display instructions visually on the user's screen with voice guidance."""
+        """Display instructions visually on the user's screen with voice guidance.
+
+        Args:
+            instruction_text: Simple text instruction to display to the user, e.g. "Tap here"
+            instruction_speech: Spoken instruction to guide the user, e.g. "Tap the menu icon in the top right corner"
+            bounding_box: Bounding box coordinates originally from the identify_screen_elements tool
+            visual_cue_type: Type of visual cue to display (default: "arrow")
+        """
         with langfuse.start_as_current_span(
             name="display_instructions",
             input={
@@ -860,28 +901,88 @@ Remember: You can only succeed when the user achieves the goal: {goal}
                     "error": "Not yet getting the actual position of target UI element. Call identify_screen_elements instead."
                 }
             
-            result = await display_instructions_tool(
-                instruction_text,
-                instruction_speech,
-                bounding_box,
-                visual_cue_type,
-                self.room,
-            )
+            display_timeout = 30  # 30 seconds timeout for re-display loop
+            max_redisplay_attempts = 3  # Prevent infinite loops
+            attempt_count = 0
             
-            # Start frame observation after successful display
-            if result.get('success') is True:                
+            while attempt_count < max_redisplay_attempts:
+                attempt_count += 1
+                logger.info(f"Display instruction attempt {attempt_count}/{max_redisplay_attempts}")
+                
+                # Display the instructions
+                result = await display_instructions_tool(
+                    instruction_text,
+                    instruction_speech,
+                    bounding_box,
+                    visual_cue_type,
+                    self.room,
+                )
+                
+                if result.get('success') is not True:
+                    span.update(level="ERROR")
+                    span.update(output=result)
+                    return result
+                
+                # Set display active and start observation
                 self.display_active = True
                 logger.info("Display is active")
-            else:
-                span.update(level="ERROR")
                 
-            span.update(output=result)
+                # Start observation with long timeout (let display_instructions handle timeout)
+                await self.frame_observer.start_observation(
+                    on_change_callback=self._on_screen_change
+                )
+                
+                # Set a very long observer timeout - let display_instructions handle the timeout
+                self.frame_observer.set_max_observation_time(display_timeout + 10)
+                
+                # Wait for either frame change or timeout
+                start_time = asyncio.get_event_loop().time()
+                screen_changed = False
+                
+                while (asyncio.get_event_loop().time() - start_time) < display_timeout:
+                    await asyncio.sleep(0.5)
+                    
+                    # Check if screen changed (frame observer detected change)
+                    if not self.frame_observer.is_active:
+                        # Frame observer stopped, meaning screen change was detected
+                        screen_changed = True
+                        logger.info("Screen change detected, display instruction successful")
+                        break
+                
+                if screen_changed:
+                    # Success! User followed the instruction
+                    span.update(output=result)
+                    return result
+                else:
+                    # Timeout reached, stop current display and re-display
+                    logger.info(f"Display timeout reached after {display_timeout} seconds, attempting re-display")
+                    
+                    # Stop current display
+                    await self.stop_display_instructions()
+                    self.display_active = False
+                    
+                    # Stop observation
+                    await self.frame_observer.stop_observation()
+                    
+                    # Short delay before re-display
+                    await asyncio.sleep(1)
             
-            return result
-            
+            # If we've exhausted all attempts
+            logger.warning(f"Failed to get user interaction after {max_redisplay_attempts} attempts")
+            span.update(output={
+                "success": False,
+                "error": f"User did not follow instruction after {max_redisplay_attempts} display attempts"
+            })
+            return {
+                "success": False,
+                "error": f"User did not follow instruction after {max_redisplay_attempts} display attempts"
+            }
+
     async def _on_screen_change(self):
         """Single callback that handles all screen change scenarios"""
         logger.info("Screen changed - handling based on current state")
+        self.identified = False
+        logger.info("Screen changed - reset identified flag")
         
         # If display is active, stop it (user followed instruction)
         if self.display_active:
@@ -889,10 +990,13 @@ Remember: You can only succeed when the user achieves the goal: {goal}
             await self.stop_display_instructions()
             self.display_active = False
         
-        # Always reset identification when screen changes
-        if self.identified:
-            logger.info("Screen changed - resetting identified flag")
-            self.identified = False
+        # Stop current observation to prevent callback loops
+        await self.frame_observer.stop_observation()
+        
+        # Note: We don't restart observation here anymore
+        # Let identify_screen_elements or display_instructions start observation when needed
+        logger.info("Stopped observation - will restart when needed")
+            
             
     async def stop_display_instructions(self) -> None:
         """Send RPC to stop display instructions at frontend"""
@@ -980,6 +1084,11 @@ Remember: You can only succeed when the user achieves the goal: {goal}
                 span.update(level="ERROR", status_message=str(e))
                 logger.error(f"Error handing back to conversation: {e}")
                 raise
+            
+    async def on_participant_disconnected(participant):
+        """Handle when a participant disconnected"""
+        logger.info(f"👋 Participant disconnected.")
+        
 
 async def entrypoint(ctx: JobContext) -> None:
     # Connect to the room
@@ -996,7 +1105,8 @@ async def entrypoint(ctx: JobContext) -> None:
     
     # Create session with userdata for navigation state
     session = AgentSession[NavigationSessionData](
-        userdata=NavigationSessionData()
+        userdata=NavigationSessionData(),
+        max_tool_steps=8
     )
 
     # Start with the ConversationAgent

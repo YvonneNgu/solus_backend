@@ -32,7 +32,7 @@ async def identify_screen_elements(
 
         # tell the user that the agent is analyzing the screen, have to wait
         session.say(
-            text="I am analyzing the screen... "
+            text="Let me analyze the screen... "
         )
 
         # Encode the VideoFrame to JPEG bytes
@@ -101,13 +101,14 @@ async def identify_screen_elements(
             return {
                 "success": True,
                 "interactive_ui_components": parsed_elements,  # Return parsed Python objects instead of JSON string
-                "instructions": "Successfully get the interactive UI elements' position on the user screen. Use the data to display instructions during guidance. "
+                "instructions": "Successfully get the interactive UI elements' position on the user screen. Use the data to display instructions. "
             }
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON response: {str(e)}")
             return {
-                "success": False,
-                "error": f"Failed to parse screen elements: {str(e)}. Apologize to the user that you faced an error and you will try to identify screen elements again."
+                "success": True,
+                "interactive_ui_components": {raw_response},  # Return raw response
+                "instructions": "Successfully get the interactive UI elements' position on the user screen. Use the data to display instructions. "
             }
         
     except Exception as e:

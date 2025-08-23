@@ -20,7 +20,7 @@ class ObserverState:
     is_active: bool = False
     task: Optional[asyncio.Task] = None
     callback: Optional[Callable] = None
-    max_observation_time: int = 30  # Maximum observation time in seconds
+    max_observation_time: int = 300  # in seconds
 
 class FrameObserver:
     """
@@ -83,8 +83,8 @@ class FrameObserver:
         check_count = 0
         
         try:
-            while self.state.is_active and check_count < self.state.max_observation_time:
-                await asyncio.sleep(1.0)  # Check every second
+            while self.state.is_active and check_count < (self.state.max_observation_time * 2):  # Convert to half-second intervals
+                await asyncio.sleep(0.5) # Check every half second
                 check_count += 1
                 
                 # Check if agent's is_on_different_screen flag changed to True
@@ -101,16 +101,14 @@ class FrameObserver:
                     # Stop observation after callback execution
                     break
                     
-            if check_count >= self.state.max_observation_time:
+            if check_count >= (self.state.max_observation_time * 2):
                 logger.info(f"Frame observation timed out after {self.state.max_observation_time} seconds")
                 
-                # Execute callback for timeout scenario if provided
-                if self.state.callback:
-                    try:
-                        await self.state.callback()
-                    except Exception as e:
-                        logger.error(f"Error in timeout callback: {e}")
+                # Do NOT execute callback for timeout scenario - let display_instructions handle timeout
+                logger.info("Timeout reached - stopping observation without callback")
                 
+        except asyncio.CancelledError:
+            logger.info("Frame observation cancelled")
         except Exception as e:
             logger.error(f"Error in frame observation: {e}")
         finally:

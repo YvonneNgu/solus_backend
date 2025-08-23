@@ -17,14 +17,11 @@ async def display_instructions(
     """Display navigation guidance with visual cues on the user's screen.
     
     Args:
-        context: The run context
         instruction_text: Simple text instruction to display to the user, e.g. "Tap here"
         instruction_speech: Spoken instruction to guide the user, e.g. "Tap the menu icon in the top right corner"
         bounding_box: Bounding box coordinates originally from the identify_screen_elements tool
         visual_cue_type: Type of visual cue to display (default: "arrow")
-        session: The agent session
         room: The LiveKit room
-        get_current_trace: Function to get the current trace
     """
     
     try:
@@ -47,7 +44,7 @@ async def display_instructions(
             return {
                 "success": False,
                 "error": "No remote participants available",
-                "instructions": "User has leave the conversation. Do nothing. The conversation will close automatically later."
+                "instructions": "User has leave the conversation. No action required. The conversation will close automatically later."
             }
 
         target_participant = remote_participants[0]
@@ -69,7 +66,7 @@ async def display_instructions(
             return {
                 "success": True,
                 "response": response,
-                "instructions": "Sucessfully display instructions on user screen. Wait for user to perform an action."
+                "instructions": "Sucessfully display instructions on user screen. No actionrequired. You will be informed once the user perform an action."
             }
 
         except rtc.RpcError as rpc_error:
