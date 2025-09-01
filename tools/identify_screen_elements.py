@@ -14,25 +14,20 @@ logger = logging.getLogger("IDENTIFY ELEMENT TOOL")
 async def identify_screen_elements(
     most_recent_frame,
     session,
-) -> Dict[str, Any]:
+) -> str:
     """Identify interactive elements and their exact positions on the user's screen.
     
     This tool analyzes the most recent screen capture to identify interactive elements along with their positions on screen.
+    Returns only the interactive UI components as text.
     """
     logger.info("Identifying interactive elements on screen")
     
     try:
-        
-        if not most_recent_frame:
-            logger.warning("No recent frame available")
-            return {
-                "success": False,
-                "error": "No recent screen capture available. Ask the user to share their screen."
-            }            
-
+       
         # tell the user that the agent is analyzing the screen, have to wait
-        session.say(
-            text="Let me analyze the screen... "
+        await session.say(
+            text="Let me analyze the screen... ",
+            add_to_chat_ctx=False
         )
 
         # Encode the VideoFrame to JPEG bytes
@@ -70,86 +65,88 @@ async def identify_screen_elements(
             response_mime_type="text/plain",
         )
         
-        # Generate content
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=model,
-            contents=contents,
-            config=generate_content_config,
-        )
-        
-        # Process and structure the response
-        raw_response = response.text
-        
-        logger.info(f"Received Gemini analysis: {raw_response[:100]}...")
-       
-        # Extract JSON content from the response (it might be wrapped in markdown code blocks)
-        json_content = raw_response
-        if "```json" in raw_response:
-            json_content = raw_response.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw_response:
-            json_content = raw_response.split("```")[1].strip()
-            
-        # Parse the JSON string into a Python structure
-        try:
-            # Parse the JSON content into a Python list of dictionaries
-            parsed_elements = json.loads(json_content)
-            
-            # Log the number of elements found
-            logger.info(f"Successfully parsed {len(parsed_elements)} UI elements from response")
-            
-            return {
-                "success": True,
-                "interactive_ui_components": parsed_elements,  # Return parsed Python objects instead of JSON string
-                "instructions": "Successfully get the interactive UI elements' position on the user screen. Use the data to display instructions. "
-            }
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON response: {str(e)}")
-            return {
-                "success": True,
-                "interactive_ui_components": {raw_response},  # Return raw response
-                "instructions": "Successfully get the interactive UI elements' position on the user screen. Use the data to display instructions. "
-            }
+        # Retry logic for JSON parsing with maximum 2 retries
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                # Generate content
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model,
+                    contents=contents,
+                    config=generate_content_config,
+                )
+                
+                # Process and structure the response
+                raw_response = response.text
+                
+                logger.info(f"Received Gemini analysis (attempt {attempt + 1}): {raw_response[:100]}...")
+               
+                # Extract JSON content from the response (it might be wrapped in markdown code blocks)
+                json_content = raw_response
+                if "```json" in raw_response:
+                    json_content = raw_response.split("```json")[1].split("```")[0].strip()
+                elif "```" in raw_response:
+                    json_content = raw_response.split("```")[1].strip()
+                    
+                # Parse the JSON string into a Python structure
+                try:
+                    # Parse the JSON content into a Python list of dictionaries
+                    parsed_elements = json.loads(json_content)
+                    
+                    # Filter out unwanted 'mask' field from each element if present
+                    # Keep only 'box_2d' and 'label' fields as these are the required fields
+                    filtered_elements = []
+                    for element in parsed_elements:
+                        if isinstance(element, dict):
+                            # Create new dict with only required fields
+                            filtered_element = {}
+                            if 'box_2d' in element:
+                                filtered_element['box_2d'] = element['box_2d']
+                            if 'label' in element:
+                                filtered_element['label'] = element['label']
+                            
+                            # Only add element if it has the required fields
+                            if 'box_2d' in filtered_element and 'label' in filtered_element:
+                                filtered_elements.append(filtered_element)
+                            else:
+                                logger.warning(f"Skipping element missing required fields: {element}")
+                    
+                    # Log the number of elements found after filtering
+                    logger.info(f"Successfully parsed and filtered {len(filtered_elements)} UI elements from response")
+                    
+                    # Convert filtered elements to string and return
+                    return str(filtered_elements)
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON response on attempt {attempt + 1}: {str(e)}")
+                    
+                    # If this is not the last attempt, continue to retry
+                    if attempt < max_retries:
+                        # tell the user that the agent is analyzing the screen, have to wait
+                        await session.say(
+                            text="I had some problems. Let me try again... ",
+                            add_to_chat_ctx=False
+                        )
+                        logger.info(f"Retrying content generation (attempt {attempt + 2}/{max_retries + 1})")
+                        continue
+                    else:
+                        # Last attempt failed, return raw response as text
+                        logger.warning("All JSON parsing attempts failed, returning raw response")
+                        return raw_response
+                        
+            except Exception as e:
+                logger.error(f"Error generating content on attempt {attempt + 1}: {str(e)}")
+                
+                # If this is not the last attempt, continue to retry
+                if attempt < max_retries:
+                    logger.info(f"Retrying due to generation error (attempt {attempt + 2}/{max_retries + 1})")
+                    continue
+                else:
+                    # Last attempt failed with error
+                    raise e
         
     except Exception as e:
         error_msg = f"Screen element identification error: {str(e)}"
         logger.error(error_msg)
-        return {
-            "success": False,
-            "error": f"{error_msg}. Apologize to the user that you faced an error and you will try to identify screen elements again."
-        }
-
-def filter_mask_content(raw_response: str) -> List[Dict[str, Any]]:
-    """Filter out the mask content from the Gemini API response.
-    
-    Args:
-        raw_response: The raw response text from Gemini API
-        
-    Returns:
-        List of dictionaries with filtered element data (no mask content)
-    """
-    try:
-        # Extract JSON content from the response (it might be wrapped in markdown code blocks)
-        json_content = raw_response
-        if "```json" in raw_response:
-            json_content = raw_response.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw_response:
-            json_content = raw_response.split("```")[1].strip()
-        
-        # Parse the JSON content
-        elements = json.loads(json_content)
-        
-        # Filter out mask content
-        filtered_elements = []
-        for element in elements:
-            filtered_element = {
-                "box_2d": element.get("box_2d", []),
-                "label": element.get("label", "Unknown element")
-            }
-            filtered_elements.append(filtered_element)
-        
-        logger.info(f"Filtered {len(filtered_elements)} UI elements from response")
-        return filtered_elements
-    except Exception as e:
-        logger.error(f"Error filtering mask content: {str(e)}")
-        return []
+        return f"{error_msg}"

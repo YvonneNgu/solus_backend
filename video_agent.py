@@ -93,9 +93,6 @@ async def lookup_weather(
 # Base agent class with shared functionality
 class BaseVideoAgent(Agent):
     def __init__(self, instructions: str, room: rtc.Room, chat_ctx: ChatContext = None, tools: List[FunctionTool] = None, **kwargs) -> None:
-        # Set default tools if none provided
-        if tools is None:
-            tools = [lookup_weather]
         
         super().__init__(
             instructions=instructions,
@@ -126,6 +123,9 @@ class BaseVideoAgent(Agent):
         self.screen_number = 0  # Track current screen number
         
         self.frame_observer = FrameObserver(self) # observe frame change
+        
+        self.summary_message = None # summarize function messages in chat ctx
+        self.summary_message_time:float = None
 
     async def close(self) -> None:
         try:
@@ -173,7 +173,6 @@ class BaseVideoAgent(Agent):
     def on_user_state_change(self, event: UserStateChangedEvent) -> None:
         old_state = event.old_state
         new_state = event.new_state
-        logger.info(f"User state changed: {old_state} -> {new_state}")
 
     def on_agent_state_change(self, event: AgentStateChangedEvent) -> None:
         old_state = event.old_state
@@ -185,131 +184,14 @@ class BaseVideoAgent(Agent):
     ) -> None:
         """User turn completed callback."""
         logger.info(f"User turn completed {langfuse.get_current_trace_id()}")
-
-    async def stt_node(
-        self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
-    ) -> Optional[AsyncIterable[stt.SpeechEvent]]:
         
-        with langfuse.start_as_current_span(
-            name="stt_node", 
-            metadata={"model": "google"}
-        ) as span:
-            try:
-                async for event in Agent.default.stt_node(self, audio, model_settings):
-                    if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                        logger.info(f"Speech recognized: {event.alternatives[0].text[:50]}...")
-                    yield event
-            except Exception as e:
-                span.update(level="ERROR", status_message=str(e))
-                logger.error(f"STT error: {e}")
-                raise
+        # Set cancellation flag if we're a NavigationAgent and display is active
+        if isinstance(self, NavigationAgent) and self.display_active:
+            logger.info("User spoke while display active - setting cancellation flag")
+            self.cancel_current_display = True
 
-    async def llm_node(
-        self,
-        chat_ctx: llm.ChatContext,
-        tools: List[FunctionTool],
-        model_settings: ModelSettings
-    ) -> AsyncIterable[llm.ChatChunk]:
 
-        dif_screen = self.is_on_different_screen
-        logger.info("Is on different screen: %s", dif_screen)
-        logger.info("Latest frame exists: %s", bool(self.latest_frame))
-        
-        # Handle screen state and messages
-        if self.latest_frame is None:
-            # User is not sharing screen: create copy and add temporary message
-            temp_chat_ctx = chat_ctx.copy()
-            temp_chat_ctx.add_message(
-                role="user",
-                content="User is not currently sharing their screen."
-            )
-            logger.info("Added 'not sharing screen' temporary message to context")
-        else:
-            # User is sharing screen: check if user is on dif screen
-            if dif_screen:
-                # User moved to a different screen: 
-                # - add latest screen frame to PERMANENT context
-                # - reset flag
-                self.screen_number += 1
-                
-                image_content = ImageContent(
-                    image=self.latest_frame
-                )
-                
-                # Add to PERMANENT context (this should persist)
-                chat_ctx.add_message(
-                    role="user",
-                    content=[f"Screen {self.screen_number}:", image_content]
-                )
-                logger.info(f"Added screen {self.screen_number} frame to permanent context")
-                
-                # Create copy after adding to permanent context (so copy includes the new screen)
-                temp_chat_ctx = chat_ctx.copy()
-                
-                self.is_on_different_screen = False
-            else:
-                # user is on the same screen: create copy and add TEMPORARY message
-                temp_chat_ctx = chat_ctx.copy()
-                temp_chat_ctx.add_message(
-                    role="user",
-                    content=f"User is on the same screen: screen {self.screen_number}"
-                )
-                logger.info(f"Added 'same screen' temporary message for screen {self.screen_number}")
-
-        # Print chat context for debugging (use temp context)
-        self.print_chat_context(temp_chat_ctx)
-
-        if self._ending_conversation:
-            logger.info("Ending conversation")
-            return
-        
-        # Use context manager for generation
-        with langfuse.start_as_current_generation(
-            name="llm_generation",
-            model="gemini-2.5-flash",
-            input=temp_chat_ctx.to_provider_format('google'),
-            metadata={
-                "temperature": 0.8,
-                "is_sharing_screen": self.latest_frame is not None,
-                "screen_number": self.screen_number,
-                "is_different_screen": dif_screen,
-                "agent": self.room.local_participant.name,
-                "timestamp": datetime.now(UTC).isoformat()
-            }
-        ) as generation:
-        
-            output = ""
-            set_completion_start_time = False
-            chunks = []
-            start_time = time.time()
             
-            try:
-                # Use temporary context for LLM call, but pass original context for Agent methods
-                async for chunk in Agent.default.llm_node(self, temp_chat_ctx, tools, model_settings):
-                    if not set_completion_start_time:
-                        generation.update(completion_start_time=datetime.now(UTC))
-                        set_completion_start_time = True
-                    if chunk.delta and chunk.delta.content:
-                        output += chunk.delta.content
-                    chunks.append(chunk)
-                    yield chunk
-                    
-            except Exception as e:
-                generation.update(level="ERROR", status_message=str(e))
-                logger.error(f"LLM error: {e}")
-                raise
-                
-            finally:
-                # Calculate response time for performance monitoring            
-                logger.info("response_time = %d", time.time() - start_time)
-                
-                if self.latest_frame and dif_screen:
-                    await self.update_chat_ctx(chat_ctx) # modify internal context to put image inside chat_ctx
-                    logger.info("Update chat ctx")
-                
-                final_output = {"role": "assistant", "content": output}
-                generation.update(output=final_output)
-    
     def print_chat_context(self, chat_ctx: llm.ChatContext) -> None:
         """Debug method to print chat context being sent to LLM"""
         
@@ -450,20 +332,7 @@ class BaseVideoAgent(Agent):
 
         logger.info("=========================================")
         
-    async def tts_node(
-        self, text: AsyncIterable[str], model_settings: ModelSettings
-    ) -> AsyncIterable[rtc.AudioFrame]:
-        with langfuse.start_as_current_span(
-            name="tts_node", 
-            metadata={"model": "google cloud tts"}  
-        ) as span:
-            try:
-                async for event in Agent.default.tts_node(self, text, model_settings):
-                    yield event
-            except Exception as e:
-                span.update(level="ERROR", status_message=str(e))
-                logger.error(f"TTS error: {e}")
-                raise
+
 
     def on_track_subscribed(
         self,
@@ -496,8 +365,7 @@ class BaseVideoAgent(Agent):
                     
                     if time_diff >= 1.0:  # Capture frames at 1 per second
                         current_frame = event.frame
-                        logger.info("testing")
-                        frame_start = time.time()
+                        self.last_frame_time = time.time()
                         
                         if self.latest_frame is None:
                             self.latest_frame = current_frame
@@ -506,26 +374,18 @@ class BaseVideoAgent(Agent):
                             frame_count += 1
                         else:
                             try:
-                                
-                                # Direct buffer comparison (no encoding needed - faster)
-                                if current_frame.data != self.latest_frame.data:
-                                    # different frame
+                                is_different, similarity = await self.is_frame_different_enough(current_frame, self.latest_frame)
+                                if is_different:
                                     self.latest_frame = current_frame
                                     self.is_on_different_screen = True
                                     logger.info("New frame detected")
                                     frame_count += 1
                                 else:
-                                    # same frame
-                                    logger.info("Skipped - same frame")
+                                    logger.info(f"Skipped - similar frame {similarity:.3f}")
                                 
                             except Exception as e:
                                 logger.error(f"Error comparing frames: {e}")
                                 return (True, "error")
-                               
-                        self.last_frame_time = current_time
-                                                
-                        frame_end = time.time()
-                        logger.info(f"Frame processing took {frame_end - frame_start:.3f}s")
                         
             except Exception as e:
                 logger.error(f"Error in video stream: {e}")
@@ -536,7 +396,7 @@ class BaseVideoAgent(Agent):
         task = asyncio.create_task(read_stream())
         task.add_done_callback(lambda t: self._tasks.remove(t) if t in self._tasks else None)
         self._tasks.append(task)
-
+        
     def calculate_frame_similarity(self, frame_data1: bytes, frame_data2: bytes) -> float:
         """Calculate similarity between two frames."""
         try:
@@ -593,23 +453,6 @@ class BaseVideoAgent(Agent):
         except Exception as e:
             logger.error(f"Error comparing frames: {e}")
             return (True, 0.0)
-        
-    async def is_frame_different_enough2(self, frame1: rtc.VideoFrame, frame2: rtc.VideoFrame) -> Tuple[bool, str]:
-        """Fast frame comparison using direct buffer comparison."""
-        try:
-            # Quick property check
-            if (frame1.width != frame2.width or 
-                frame1.height != frame2.height or
-                frame1.format != frame2.format):
-                return (True, "different_dimensions")
-            
-            # Direct buffer comparison (no encoding needed!)
-            is_different = frame1.data != frame2.data
-            return (is_different, "identical" if not is_different else "different")
-            
-        except Exception as e:
-            logger.error(f"Error comparing frames: {e}")
-            return (True, "error")
 
 # Conversation Agent - handles general questions and decides when to hand off
 class ConversationAgent(BaseVideoAgent):
@@ -682,8 +525,12 @@ Response guidelines:
                 navigation_agent = NavigationAgent(
                     room=self.room,
                     goal=goal,
-                    chat_ctx=self.session.current_agent.chat_ctx.copy()  # Pass current chat context
+                    chat_ctx=self.chat_ctx  # Pass current chat context
                 )
+                logger.info("hand off - self.chat_ctx")
+                self.print_chat_context(self.chat_ctx)
+                logger.info("hand off - self.session.chat_ctx")
+                self.print_chat_context(self.session._chat_ctx)
                 
                 # Transfer basic frame state (but not the video stream itself)
                 navigation_agent.latest_frame = self.latest_frame
@@ -773,42 +620,180 @@ Response guidelines:
                 
             except Exception as e:
                 logger.error(f"Error ending conversation: {e}")
+                
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: List[FunctionTool],
+        model_settings: ModelSettings
+    ) -> AsyncIterable[llm.ChatChunk]:
+        
+        dif_screen = self.is_on_different_screen
+        logger.info("Is on different screen: %s", dif_screen)
+        logger.info("Latest frame exists: %s", bool(self.latest_frame))
+        
+        # merge assistant message in session chat_ctx into chat_ctx
+        # chat_ctx only has function message
+        chat_ctx.merge(other_chat_ctx=self.session._chat_ctx, exclude_function_call=True,exclude_instructions=True)
+                
+        # Handle screen state and messages
+        if self.latest_frame is None:
+            # User is not sharing screen: create copy and add temporary message
+            temp_chat_ctx = chat_ctx.copy()
+            temp_chat_ctx.add_message(
+                role="user",
+                content="User is not currently sharing their screen."
+            )
+            logger.info("Added 'not sharing screen' temporary message to context")
+        else:
+            # User is sharing screen: check if user is on dif screen
+            if dif_screen:
+                # User moved to a different screen: 
+                # - add latest screen frame to PERMANENT context
+                # - reset flag
+                self.screen_number += 1
+                
+                image_content = ImageContent(
+                    image=self.latest_frame
+                )
+                
+                # Add to PERMANENT context (this should persist)
+                chat_ctx.add_message(
+                    role="user",
+                    content=[f"Screen {self.screen_number}:", image_content]
+                )
+                logger.info(f"Added screen {self.screen_number} frame to permanent context")
+                
+                # Create copy after adding to permanent context (so copy includes the new screen)
+                temp_chat_ctx = chat_ctx.copy()
+                
+                self.is_on_different_screen = False
+            else:
+                # user is on the same screen: create copy and add TEMPORARY message
+                temp_chat_ctx = chat_ctx.copy()
+                temp_chat_ctx.add_message(
+                    role="user",
+                    content=f"User is on the screen {self.screen_number}"
+                )
+                logger.info(f"Added 'same screen' temporary message for screen {self.screen_number}")
 
+        # Print chat context for debugging (use temp context)
+        self.print_chat_context(temp_chat_ctx)
+
+        if self._ending_conversation:
+            logger.info("Ending conversation")
+            return
+        
+        # Use context manager for generation
+        with langfuse.start_as_current_generation(
+            name="llm_generation",
+            model="gemini-2.5-flash",
+            input=temp_chat_ctx.to_provider_format('google'),
+            metadata={
+                "temperature": 0.8,
+                "is_sharing_screen": self.latest_frame is not None,
+                "screen_number": self.screen_number,
+                "is_different_screen": dif_screen,
+                "agent": self.room.local_participant.name,
+                "timestamp": datetime.now(UTC).isoformat()
+            }
+        ) as generation:
+        
+            output = ""
+            set_completion_start_time = False
+            chunks = []
+            start_time = time.time()
+            
+            try:
+                # Use temporary context for LLM call, but pass original context for Agent methods
+                async for chunk in Agent.default.llm_node(self, temp_chat_ctx, tools, model_settings):
+                    if not set_completion_start_time:
+                        generation.update(completion_start_time=datetime.now(UTC))
+                        set_completion_start_time = True
+                    if chunk.delta and chunk.delta.content:
+                        output += chunk.delta.content
+                    chunks.append(chunk)
+                    yield chunk
+                
+            except Exception as e:
+                generation.update(level="ERROR", status_message=str(e))
+                logger.error(f"LLM error: {e}")
+                raise
+                
+            finally:
+                # Calculate response time for performance monitoring            
+                logger.info("response_time = %d", time.time() - start_time)
+                
+                await self.update_chat_ctx(chat_ctx)
+                logger.info("Update chat ctx")
+                
+                final_output = {"role": "assistant", "content": output}
+                logger.info(f"Assistant: {output}")
+                generation.update(output=final_output)
+
+    async def stt_node(
+        self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
+    ) -> Optional[AsyncIterable[stt.SpeechEvent]]:
+        """STT node for ConversationAgent with custom processing."""
+        
+        with langfuse.start_as_current_span(
+            name="conversation_stt_node", 
+            metadata={"model": "google", "agent": "conversation"}
+        ) as span:
+            try:
+                async for event in Agent.default.stt_node(self, audio, model_settings):
+                    if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                        logger.info(f"ConversationAgent - Speech recognized: {event.alternatives[0].text[:50]}...")
+                    yield event
+            except Exception as e:
+                span.update(level="ERROR", status_message=str(e))
+                logger.error(f"ConversationAgent STT error: {e}")
+                raise
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        """TTS node for ConversationAgent with custom processing."""
+        
+        with langfuse.start_as_current_span(
+            name="conversation_tts_node", 
+            metadata={"model": "google cloud tts", "agent": "conversation"}  
+        ) as span:
+            try:
+                async for event in Agent.default.tts_node(self, text, model_settings):
+                    yield event
+            except Exception as e:
+                span.update(level="ERROR", status_message=str(e))
+                logger.error(f"ConversationAgent TTS error: {e}")
+                raise
+    
+    
 # Navigation Agent - handles step-by-step UI guidance
 class NavigationAgent(BaseVideoAgent):
     def __init__(self, room: rtc.Room, goal: str, chat_ctx: ChatContext = None) -> None:
         instructions = f"""
-You are the navigation specialist for Solus, focused on providing step-by-step mobile interface guidance.
+You are Solus, a friendly mobile voice assistant designed for low-literate users in Malaysia who are not familiar with technology. Your role is to help the user achieve this specific goal through step-by-step guidance. You will be given `interactive_ui_components` which is an array of objects each with `label` and `box_2d: [top, left, bottom, right]`.  
 
 CURRENT GOAL: {goal}
 
-Your role is to:
-1. Help the user achieve this specific goal through step-by-step guidance
-2. Always identify screen elements FIRST before giving instructions
-3. Use display_instructions to show visual cues for each step
-4. Continue until the goal is achieved, then hand back to conversation agent
-5. Be patient and provide corrective instructions if needed
-
-Process for each step:
-1. Use identify_screen_elements to get current screen layout
-2. Use display_instructions to show visual cues for the next action
-3. Wait for user to follow the instruction. Assume user follow the instruction when they are on a different screen. 
-4. Check if goal is achieved or continue to next step
+**Loop Behavior**  
+2. Determine the *single next* action the user should take to advance toward their goal (e.g. tap “Settings”).  
+3. Speak a **very simple**, patient instruction (“Please tap the Settings button.”).  
+4. Find the position of the target UI element in the interactive ui components list given, then display the visual cue on the user screen by calling `display_instructions()`.  
+5. Repeat **only when** the screen updates, until the goal is achieved or the user wants to stop.  
 
 Response guidelines:
 - Keep responses short and clear
 - Use everyday language, no technical terms
-- Always provide visual guidance using display_instructions
 - Say "Sorry for the confusion, let me correct it" when providing corrections
-- End guidance when goal is achieved
+- Response in plain text only, no markdown formatting. Your response will be read aloud to the user
 
 Remember: 
 - You can only succeed when the user achieves the goal: {goal}
-- If user want to stop the guiding process, speak nothing and hand back to conversation agent
-- When handing back, don't mention because user think you are one. 
+- If user want to stop the guiding process, response nothing and hand back to conversation agent
 """
 
-        # NavigationAgent tools: identify_screen_elements, display_instructions, hand_back_to_conversation
+        # NavigationAgent tools: display_instructions, hand_back_to_conversation
         super().__init__(
             instructions=instructions,
             room=room,
@@ -820,53 +805,139 @@ Remember:
         self.identified = False
         self.display_active = False
         
+        # Cache for identified frames to avoid redundant identifications
+        self.identified_frames = []  # List of {frame: VideoFrame, components: dict}
+        #self.last_message_time:float = None
+        
+        # Flag to cancel current display instructions when user speaks
+        self.cancel_current_display = False
 
+    async def _find_cached_frame_components(self, current_frame: rtc.VideoFrame) -> Optional[str]:
+        """
+        Helper function to check if current frame matches any cached frame.
+        Returns the cached components if found, None otherwise.
+        
+        Args:
+            current_frame: The current video frame to compare
+            
+        Returns:
+            String containing the cached interactive_ui_components if found, None otherwise
+        """
+        if not current_frame or not self.identified_frames:
+            return None
+            
+        try:
+            # Search through cached frames starting from the most recent (reverse order)
+            for cached_entry in reversed(self.identified_frames):
+                cached_frame = cached_entry["frame"]
+
+                is_different, similarity = await self.is_frame_different_enough(current_frame, cached_frame)
+                if not is_different: # look for frame that has similarity > 98%
+                    logger.info("Found matching cached frame components with similarity: %s", similarity)
+                    return cached_entry["components"]
+                    
+        except Exception as e:
+            logger.error(f"Error comparing frames: {e}")
+            
+        return None
+        
+    def _cache_frame_components(self, frame: rtc.VideoFrame, components: str) -> None:
+        """
+        Cache the frame and its identified components.
+        
+        Args:
+            frame: The video frame to cache
+            components: The identified interactive UI components as text
+        """
+        try:
+            # Add to cache (keep only last 5 frames to manage memory)
+            self.identified_frames.append({
+                "frame": frame,
+                "components": components
+            })
+            
+            # Keep cache size reasonable
+            if len(self.identified_frames) > 5:
+                self.identified_frames.pop(0)
+                
+            logger.info(f"Cached frame components. Cache size: {len(self.identified_frames)}")
+            
+        except Exception as e:
+            logger.error(f"Error caching frame components: {e}")
 
     async def on_enter(self) -> None:
+        # Start background identification if we have a frame (non-blocking)
+        if self.latest_frame:
+            logger.info("Starting background screen element identification on enter")
+            await self.identify_screen_elements(self.session)
+
         await self.session.generate_reply(
-            instructions=f"Briefly acknowledge that you'll help with: {self.goal}. Then immediately start by identifying screen elements to begin guidance."
+            instructions=f"Briefly acknowledge that you'll help with: {self.goal}. Ask the user to share their screen if they are not sharing."
         )
         self.session.on("user_state_changed", self.on_user_state_change)
         self.session.on("agent_state_changed", self.on_agent_state_change)
         self.room.on("track_subscribed", self.on_track_subscribed)
-
-    @function_tool()
-    async def identify_screen_elements(
-        self,
-        context: RunContext,
-    ) -> Dict[str, Any]:
-        """Identify all interactive components and their positions on the user's current screen."""
         
-        with langfuse.start_as_current_span(
-            name="identify_screen_elements_tool"
-        ) as span:
-            logger.info("Identified: %s", self.identified)
-            if self.identified:
-                # Already identified, no need to identify again
-                return {
-                    "success": False, 
-                    "error": "The UI elements and their position data already exists, refer to the last identify_screen_elements function response in the chat context."
-                }
-            try:
-                result = await identify_screen_elements_tool(
-                    self.latest_frame if self.latest_frame else None,
-                    context.session
-                )
-                
-                # after successful identification, mark as identified
-                if result.get('success') is True:
-                    self.identified = True
-                    logger.info("Set value of Identified to: %s", self.identified)
-                    
-                    # Don't start observation here - let display_instructions handle it
-                    logger.info("Screen elements identified successfully")
-                
-                span.update(output=result)
-                return result
+    async def identify_screen_elements(self, session) -> bool:
+        """Identify screen elements and cache them if successful.
+        
+        Args:
+            session: The session object for identification
             
-            except Exception as e:
-                span.update(level="ERROR", status_message=str(e))
-                raise
+        Returns:
+            bool: True if identification was successful, False otherwise
+        """
+        try:
+            result = await identify_screen_elements_tool(
+                self.latest_frame if self.latest_frame else None,
+                session
+            )
+            
+            # The result is now a string (text) from the modified identify_screen_elements tool function
+            if result and not result.startswith("Screen element identification error"):
+                self.identified = True
+                logger.info("Success, set value of Identified to: %s", self.identified)
+                
+                # Cache the frame and its components for future use
+                # We store the result string directly
+                self._cache_frame_components(self.latest_frame, result)
+                return True
+            
+            return False
+        
+        except Exception as e:
+            error_msg = f"Error identifying screen elements: {str(e)}"
+            logger.error(error_msg)
+            return False
+
+    async def get_interactive_ui_components(
+        self,
+        session,
+    ) -> str:
+        """Get interactive UI components and their positions on the user's current screen.
+        
+        Returns:
+            str: The interactive UI components as text.
+        """
+        # First check if we have cached components for this frame
+        if self.latest_frame:
+            cached_components = await self._find_cached_frame_components(self.latest_frame)
+            if cached_components:
+                # Found cached result, return it and mark as identified
+                self.identified = True
+                logger.info("Using cached frame components, set identified to: %s", self.identified)
+                # Return the cached components directly as they're already a string
+                return cached_components
+        
+        # If no cached components found, return the last available components if any exist
+        if self.identified_frames:
+            # Use the most recent cached components
+            last_components = self.identified_frames[-1]["components"]
+            logger.info("Using last cached components from previous screen")
+            return last_components
+        
+        # If identification failed or no cached result found, return error message
+        return "Screen element identification failed"
 
     @function_tool()
     async def display_instructions(
@@ -882,7 +953,7 @@ Remember:
         Args:
             instruction_text: Simple text instruction to display to the user, e.g. "Tap here"
             instruction_speech: Spoken instruction to guide the user, e.g. "Tap the menu icon in the top right corner"
-            bounding_box: Bounding box coordinates originally from the identify_screen_elements tool
+            bounding_box: Bounding box coordinates originally from the interactive_ui_components 
             visual_cue_type: Type of visual cue to display (default: "arrow")
         """
         with langfuse.start_as_current_span(
@@ -894,18 +965,36 @@ Remember:
                 "visual_cue_type": visual_cue_type
             }
         ) as span:
+            # Reset cancellation flag at start of new display instruction
+            self.cancel_current_display = False
+            
+            # Stop any previous active display
+            if self.display_active:
+                logger.info("Stopping previous display instruction")
+                await self.stop_display_instructions()
+                self.display_active = False
+                await self.frame_observer.stop_observation()
+            
             if not self.identified:
-                # must identify before display instructions
-                return {
-                    "success": False,
-                    "error": "Not yet getting the actual position of target UI element. Call identify_screen_elements instead."
-                }
+                # Need to identify screen elements first - do this asynchronously
+                logger.info("Screen elements not identified, triggering identification...")
+                success = await self.identify_screen_elements(context.session)
+                if not success:
+                    return {
+                        "success": False,
+                        "error": "Failed to identify screen elements. Please ensure your screen is clearly visible and try again."
+                    }
             
             display_timeout = 30  # 30 seconds timeout for re-display loop
             max_redisplay_attempts = 3  # Prevent infinite loops
             attempt_count = 0
             
             while attempt_count < max_redisplay_attempts:
+                # Check for cancellation before each attempt
+                if self.cancel_current_display:
+                    logger.info("Display instruction cancelled by user speech before attempt")
+                    return None  # Return None so no response triggers LLM
+                
                 attempt_count += 1
                 logger.info(f"Display instruction attempt {attempt_count}/{max_redisplay_attempts}")
                 
@@ -918,9 +1007,13 @@ Remember:
                     self.room,
                 )
                 
+                # Fail to display virtual instructions on frontend app, the agent will try to guide with speech only
                 if result.get('success') is not True:
                     span.update(level="ERROR")
                     span.update(output=result)
+                    # Clean up chat context with failure summary
+                    self.summary_message = f"[Assistant fail to display instructions: {instruction_text} at {bounding_box}, tried with speech only]"
+                    self.summary_message_time = time.time() + 0.003
                     return result
                 
                 # Set display active and start observation
@@ -940,6 +1033,14 @@ Remember:
                 screen_changed = False
                 
                 while (asyncio.get_event_loop().time() - start_time) < display_timeout:
+                    # Check for cancellation first
+                    if self.cancel_current_display:
+                        logger.info("Display instruction cancelled by user speech")
+                        await self.stop_display_instructions()
+                        self.display_active = False
+                        await self.frame_observer.stop_observation()
+                        return None  # Return None so no response triggers LLM
+                    
                     await asyncio.sleep(0.5)
                     
                     # Check if screen changed (frame observer detected change)
@@ -950,8 +1051,13 @@ Remember:
                         break
                 
                 if screen_changed:
-                    # Success! User followed the instruction
+                    # user followed the instruction - before timeout
                     span.update(output=result)
+                    # Clean up chat context with success summary
+                    self.summary_message = f"[Assistant displayed instructions: '{instruction_text}' at {bounding_box}]"
+                    self.summary_message_time = time.time() + 0.003
+                    await self.identify_screen_elements(self.session)
+
                     return result
                 else:
                     # Timeout reached, stop current display and re-display
@@ -973,16 +1079,21 @@ Remember:
                 "success": False,
                 "error": f"User did not follow instruction after {max_redisplay_attempts} display attempts"
             })
+            # Clean up chat context with no response summary
+            self.summary_message = f"[Assistant displayed instructions: {instruction_text} at {bounding_box}, but user did not follow the instructions]"
+            self.summary_message_time = time.time() + 0.003
             return {
                 "success": False,
-                "error": f"User did not follow instruction after {max_redisplay_attempts} display attempts"
+                "error": f"User did not follow instruction after {max_redisplay_attempts} display attempts. Ask user if they have any other questions. "
             }
 
     async def _on_screen_change(self):
         """Single callback that handles all screen change scenarios"""
-        logger.info("Screen changed - handling based on current state")
         self.identified = False
         logger.info("Screen changed - reset identified flag")
+        
+        # Clear cancellation flag since user actually followed instruction
+        self.cancel_current_display = False
         
         # If display is active, stop it (user followed instruction)
         if self.display_active:
@@ -992,9 +1103,6 @@ Remember:
         
         # Stop current observation to prevent callback loops
         await self.frame_observer.stop_observation()
-        
-        # Note: We don't restart observation here anymore
-        # Let identify_screen_elements or display_instructions start observation when needed
         logger.info("Stopped observation - will restart when needed")
             
             
@@ -1059,7 +1167,7 @@ Remember:
                 # Create conversation agent with preserved context
                 conversation_agent = ConversationAgent(
                     room=self.room,
-                    chat_ctx=self.session.current_agent.chat_ctx.copy()  # Pass current chat context
+                    chat_ctx=self.session._chat_ctx  # Pass current chat context
                 )
                 
                 # Transfer the complete video stream state back
@@ -1069,6 +1177,8 @@ Remember:
                 conversation_agent._tasks = self._tasks  # Transfer tasks
                 conversation_agent.is_on_different_screen = self.is_on_different_screen
                 conversation_agent.screen_number = self.screen_number
+                conversation_agent.summary_message = None
+                conversation_agent.summary_message_time = None
                 
                 # Don't close video stream on current agent since we're transferring it
                 self.video_stream = None  # Remove reference to prevent double closure
@@ -1085,10 +1195,207 @@ Remember:
                 logger.error(f"Error handing back to conversation: {e}")
                 raise
             
-    async def on_participant_disconnected(participant):
-        """Handle when a participant disconnected"""
-        logger.info(f"👋 Participant disconnected.")
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: List[FunctionTool],
+        model_settings: ModelSettings
+    ) -> AsyncIterable[llm.ChatChunk]:
+        """
+        A node in the processing pipeline that processes text generation with an LLM.
+
+        By default, this node uses the agent's LLM to process the provided context. It may yield plain text (as str) for straightforward text generation, or ChatChunk objects that can include text and optional tool calls. ChatChunk is helpful for capturing more complex outputs such as function calls, usage statistics, or other metadata.
+
+        Can override this node to customize how the LLM is used or how tool invocations and responses are handled.
+        """
         
+        dif_screen = self.is_on_different_screen
+        logger.info("Is on different screen: %s", dif_screen)
+        logger.info("Latest frame exists: %s", bool(self.latest_frame))
+        
+        # merge assistant message in session chat_ctx into chat_ctx
+        # chat_ctx only has function message
+        chat_ctx.merge(other_chat_ctx=self.session._chat_ctx, exclude_function_call=True,exclude_instructions=True)
+        
+        # Handle function messages in chat ctx - for nav agent
+        if self.summary_message is not None and self.summary_message_time is not None:
+            # just display the instruction
+            # remove function message, add summary message, update to session chat ctx
+            chat_ctx = chat_ctx.copy(exclude_function_call=True)
+            #chat_ctx.add_message(
+            #    role="assistant",
+            #    content=self.summary_message,
+            #    created_at=self.summary_message_time
+            #)
+            self.summary_message=None
+            # Set session chat context to the updated context
+            self.session._chat_ctx = chat_ctx
+            logger.info("Updated session._chat_ctx with summary message")
+            
+        # elif self.summary_message is None and self.summary_message_time is not None:
+        #     # just identify elements, llm need to know the function response
+        #     # or: error messages of display_instructions tool call
+        #     # Append new messages (after last display) to session._chat_ctx
+        #     if self.last_message_time:
+        #         recent_messages = []
+        #         for item in chat_ctx.items:
+        #             # Check if item has created_at attribute and is newer than summary_message_time
+        #             if hasattr(item, 'created_at') and item.created_at > self.last_message_time:
+        #                 recent_messages.append(item)
+            
+        #         if recent_messages:
+        #             # Insert the recent messages into session chat context
+        #             self.session._chat_ctx.insert(recent_messages)
+        #         else:
+        #             logger.info("No recent messages found to append to session context")
+                    
+        #         self.last_message_time = None
+        #         chat_ctx = self.session._chat_ctx
+        #     else:
+        #         logger.error("The last_message_time is null")
+        
+        
+        # Handle screen state and messages
+        if self.latest_frame is None:
+            # User is not sharing screen: create copy and add temporary message
+            temp_chat_ctx = chat_ctx.copy()
+            temp_chat_ctx.add_message(
+                role="user",
+                content="User is not currently sharing their screen."
+            )
+            logger.info("Added 'not sharing screen' temporary message to context")
+        else:
+            # User is sharing screen: check if user is on dif screen
+            if dif_screen:
+                # User moved to a different screen: 
+                # - add latest screen frame to PERMANENT context
+                # - reset flag
+                self.screen_number += 1
+                
+                image_content = ImageContent(
+                    image=self.latest_frame
+                )
+                
+                # Add to PERMANENT context (this should persist)
+                chat_ctx.add_message(
+                    role="user",
+                    content=[f"Screen {self.screen_number}:", image_content]
+                )
+                logger.info(f"Added screen {self.screen_number} frame to permanent context")
+                
+                # Create copy after adding to permanent context (so copy includes the new screen)
+                temp_chat_ctx = chat_ctx.copy()
+                
+                self.is_on_different_screen = False
+            else:
+                # user is on the same screen: create copy and add TEMPORARY message
+                temp_chat_ctx = chat_ctx.copy()
+                temp_chat_ctx.add_message(
+                    role="user",
+                    content=f"User is on the screen {self.screen_number}"
+                )
+                logger.info(f"Added 'same screen' temporary message for screen {self.screen_number}")
+            
+            # add interactive ui components to the context
+            interactive_ui_components = await self.get_interactive_ui_components(self.session)
+            temp_chat_ctx.add_message(
+                role="user",
+                content= interactive_ui_components
+            )
+            logger.info("Added interactive ui components to the context")
+
+        # Print chat context for debugging (use temp context)
+        self.print_chat_context(temp_chat_ctx)
+
+        if self._ending_conversation:
+            logger.info("Ending conversation")
+            return
+        
+        # Use context manager for generation
+        with langfuse.start_as_current_generation(
+            name="llm_generation",
+            model="gemini-2.5-flash",
+            input=temp_chat_ctx.to_provider_format('google'),
+            metadata={
+                "temperature": 0.8,
+                "is_sharing_screen": self.latest_frame is not None,
+                "screen_number": self.screen_number,
+                "is_different_screen": dif_screen,
+                "agent": self.room.local_participant.name,
+                "timestamp": datetime.now(UTC).isoformat()
+            }
+        ) as generation:
+        
+            output = ""
+            set_completion_start_time = False
+            chunks = []
+            start_time = time.time()
+            
+            try:
+                # Use temporary context for LLM call, but pass original context for Agent methods
+                async for chunk in Agent.default.llm_node(self, temp_chat_ctx, tools, model_settings):
+                    if not set_completion_start_time:
+                        generation.update(completion_start_time=datetime.now(UTC))
+                        set_completion_start_time = True
+                    if chunk.delta and chunk.delta.content:
+                        output += chunk.delta.content
+                    chunks.append(chunk)
+                    yield chunk
+                                    
+                # if self.summary_message is None and self.summary_message_time is not None:
+                #     self.last_message_time = (time.time() + start_time)/2
+                
+            except Exception as e:
+                generation.update(level="ERROR", status_message=str(e))
+                logger.error(f"LLM error: {e}")
+                raise
+                
+            finally:
+                # Calculate response time for performance monitoring            
+                logger.info("response_time = %d", time.time() - start_time)
+                
+                await self.update_chat_ctx(chat_ctx)
+                logger.info("Update chat ctx")
+                
+                final_output = {"role": "assistant", "content": output}
+                logger.info(f"Assistant: {output}")
+                generation.update(output=final_output)
+
+    async def stt_node(
+        self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
+    ) -> Optional[AsyncIterable[stt.SpeechEvent]]:
+        """STT node for NavigationAgent with custom processing."""
+        
+        with langfuse.start_as_current_span(
+            name="navigation_stt_node", 
+            metadata={"model": "google", "agent": "navigation"}
+        ) as span:
+            try:
+                async for event in Agent.default.stt_node(self, audio, model_settings):
+                    if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                        logger.info(f"NavigationAgent - Speech recognized: {event.alternatives[0].text[:50]}...")
+                    yield event
+            except Exception as e:
+                span.update(level="ERROR", status_message=str(e))
+                logger.error(f"NavigationAgent STT error: {e}")
+                raise
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        """TTS node for NavigationAgent with custom processing."""
+        
+        with langfuse.start_as_current_span(
+            name="navigation_tts_node", 
+            metadata={"model": "google cloud tts", "agent": "navigation"}  
+        ) as span:
+            try:
+                async for event in Agent.default.tts_node(self, text, model_settings):
+                    yield event
+            except Exception as e:
+                span.update(level="ERROR", status_message=str(e))
+                logger.error(f"NavigationAgent TTS error: {e}")
+                raise
 
 async def entrypoint(ctx: JobContext) -> None:
     # Connect to the room

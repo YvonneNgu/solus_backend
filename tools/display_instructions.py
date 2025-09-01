@@ -19,7 +19,7 @@ async def display_instructions(
     Args:
         instruction_text: Simple text instruction to display to the user, e.g. "Tap here"
         instruction_speech: Spoken instruction to guide the user, e.g. "Tap the menu icon in the top right corner"
-        bounding_box: Bounding box coordinates originally from the identify_screen_elements tool
+        bounding_box: Bounding box coordinates originally from the get_interactive_ui_components method
         visual_cue_type: Type of visual cue to display (default: "arrow")
         room: The LiveKit room
     """

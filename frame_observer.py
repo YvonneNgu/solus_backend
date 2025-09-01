@@ -45,10 +45,10 @@ class FrameObserver:
         Args:
             on_change_callback: Optional callback to execute when frame change is detected
         """
-        logger.warning("Start observation, dif screen: %s", bool(self.agent.is_on_different_screen))
+        logger.info("Start observation, dif screen: %s", bool(self.agent.is_on_different_screen))
         
         if self.state.is_active:
-            logger.warning("Frame observation already active, stopping previous observer")
+            logger.info("Frame observation already active, stopping previous observer")
             await self.stop_observation()
         
         self.state.is_active = True
